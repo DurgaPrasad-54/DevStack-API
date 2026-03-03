@@ -1,5 +1,5 @@
 const express = require("express");
-const Folder = require("../models/Hackfolder");
+const Folder = require("../Models/Hackfolder");
 const { authenticateToken } = require("../../middleware/auth");
 
 const router = express.Router();

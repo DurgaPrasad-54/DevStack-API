@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const Hackathon = require('../models/HackathonAdmin');
+const Hackathon = require('../Models/HackathonAdmin');
 const upload = require("../middleware/upload");
 const { authenticateToken } = require("../../middleware/auth");
 
@@ -108,7 +108,7 @@ router.get('/all', async (req, res) => {
 // GET /hackathon - Return all hackathons
 router.get('/', async (req, res) => {
   try {
-  const hackathons = await require('../models/HackathonAdmin').find();
+  const hackathons = await require('../Models/HackathonAdmin').find();
     res.json(hackathons);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch hackathons' });

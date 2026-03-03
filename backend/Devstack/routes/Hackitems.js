@@ -1,5 +1,5 @@
 const express = require("express");
-const Item = require("../models/Hackitems");
+const Item = require("../Models/Hackitems");
 const { authenticateToken } = require("../../middleware/auth");
 
 const router = express.Router();

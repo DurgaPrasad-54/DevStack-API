@@ -1,7 +1,7 @@
 const express = require("express");
 const multer = require("multer");
-const Notes = require("../models/Hacknotes");
-const Folder = require("../models/Hackfolder");
+const Notes = require("../Models/Hacknotes");
+const Folder = require("../Models/Hackfolder");
 const { authenticateToken } = require("../../middleware/auth");
 
 const router = express.Router();
