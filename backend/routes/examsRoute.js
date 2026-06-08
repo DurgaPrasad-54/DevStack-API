@@ -4,256 +4,290 @@ const { authenticateToken } = require("../middleware/auth");
 const mongoose = require("mongoose");
 const Question = require("../models/questionModel");
 const { Student } = require("../models/roles");
-const Report = require("../models/reportModel"); // Import Report model
+const Report = require("../models/reportModel");
+const { asyncHandler, AppError } = require("../utils/errorHandler");
 
-// add exam
-router.post("/add", authenticateToken, async (req, res) => {
-  try {
-    // check if exam already exists
-    const examExists = await Exam.findOne({ name: req.body.name });
-    if (examExists) {
-      return res
-        .status(200)
-        .send({ message: "Exam already exists", success: false });
-    }
-    if (!req.body.currentYear) {
-      return res.status(400).send({ message: "Current year is required", success: false });
-    }
-    req.body.questions = [];
-    const newExam = new Exam(req.body);
-    await newExam.save();
-    res.send({
-      message: "Exam added successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+// Add exam
+router.post("/add", authenticateToken, asyncHandler(async (req, res) => {
+  const { name, currentYear } = req.body;
+
+  if (!currentYear) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Current year is required" 
     });
   }
-});
 
-// get all exams
-router.post("/get-all-exams", authenticateToken, async (req, res) => {
-  try {
-    const exams = await Exam.find({});
-    console.log(exams)
-    res.send({
-      message: "Exams fetched successfully",
-      data: exams,
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  const examExists = await Exam.findOne({ name, currentYear }).lean();
+  if (examExists) {
+    return res.status(409).json({ 
+      success: false, 
+      message: "Exam already exists for this year" 
     });
   }
-});
 
-// get all exams
-// router.post("/get-all-exams", authenticateToken, async (req, res) => {
-//   try {
-//     const studentId = new mongoose.Types.ObjectId(req.body.userId); // Correctly create ObjectId
-//     const exams = await Exam.find({});
+  const newExam = new Exam({ ...req.body, questions: [] });
+  await newExam.save();
+  
+  res.status(201).json({
+    success: true,
+    message: "Exam added successfully",
+    data: newExam,
+  });
+}));
 
-//     const ongoingExams = exams.filter(exam => !exam.attemptedBy.some(id => id.equals(studentId)));
-//     const completedExams = exams.filter(exam => exam.attemptedBy.some(id => id.equals(studentId)));
-//     console.log(completedExams);
-//     res.send({
-//       message: "Exams fetched successfully",
-//       data: {
-//         ongoingExams,
-//         completedExams
-//       },
-//       success: true,
-//     });
-//   } catch (error) {
-//     res.status(500).send({
-//       message: error.message,
-//       data: error,
-//       success: false,
-//     });
-//   }
-// });
+// Get all exams - OPTIMIZED
+router.post("/get-all-exams", authenticateToken, asyncHandler(async (req, res) => {
+  const exams = await Exam.find({})
+    .select("name description currentYear duration questions createdAt")
+    .lean()
+    .limit(1000); // Safety limit
 
-// get user-specific exams
-router.post("/get-user-exams", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.body.userId;
-    let currentYear = req.body.currentYear; // allow currentYear from request
-    console.log(userId,currentYear)
-    if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).send({ message: "Invalid or missing user ID", success: false });
-    }
-    const studentId = new mongoose.Types.ObjectId(userId);
-    const student = await Student.findById(userId);
-    if (!student) {
-      return res.status(404).send({ message: "Student not found", success: false });
-    }
-    // If currentYear is not provided in req.body, use student's currentYear
-    if (!currentYear) {
-      currentYear = student.currentYear;
-    }
-    if (!currentYear) {
-      return res.status(400).send({
-        message: "Your current year is not set. Please contact admin.",
-        success: false,
-        data: { ongoingExams: [], completedExams: [] }
-      });
-    }
-    // Only fetch exams for the specified current year
-    const exams = await Exam.find({ currentYear });
-    if (!exams || exams.length === 0) {
-      return res.status(200).send({
-        message: `No exams found for the current year (${currentYear}).`,
-        success: true,
-        data: { ongoingExams: [], completedExams: [] }
-      });
-    }
-    const ongoingExams = exams.filter(exam => !exam.attemptedBy.some(id => id.equals(studentId)));
-    const completedExams = exams.filter(exam => exam.attemptedBy.some(id => id.equals(studentId)));
-    
-    res.send({
-      message: "User-specific exams fetched successfully",
-      data: {
-        ongoingExams,
-        completedExams
-      },
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  res.json({
+    success: true,
+    message: "Exams fetched successfully",
+    data: exams,
+  });
+}));
+
+// Get user-specific exams - OPTIMIZED
+router.post("/get-user-exams", authenticateToken, asyncHandler(async (req, res) => {
+  const { userId, currentYear: requestedYear } = req.body;
+
+  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid user ID" 
     });
   }
-});
 
+  const student = await Student.findById(userId)
+    .select("currentYear")
+    .lean();
 
-// get exam by id
-router.post("/get-exam-by-id", authenticateToken, async (req, res) => {
-  try {
-    const exam = await Exam.findById(req.body.examId).populate("questions");
-    res.send({
-      message: "Exam fetched successfully",
-      data: exam,
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  if (!student) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Student not found" 
     });
   }
-});
 
-// edit exam by id
-router.post("/edit-exam-by-id", authenticateToken, async (req, res) => {
-  try {
-    await Exam.findByIdAndUpdate(req.body.examId, req.body);
-    res.send({
-      message: "Exam edited successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
+  const targetYear = requestedYear || student.currentYear;
+
+  if (!targetYear) {
+    return res.status(400).json({
       success: false,
+      message: "Current year not set",
+      data: { ongoingExams: [], completedExams: [] },
     });
   }
-});
 
-// delete exam by id
-router.post("/delete-exam-by-id", authenticateToken, async (req, res) => {
-  try {
-    await Exam.findByIdAndDelete(req.body.examId);
-    res.send({
-      message: "Exam deleted successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  // Single query with filtering - NO N+1 PROBLEM
+  const exams = await Exam.find({ currentYear: targetYear })
+    .select("name description duration questions attemptedBy")
+    .lean();
+
+  const studentObjId = new mongoose.Types.ObjectId(userId);
+  const ongoingExams = exams.filter(
+    exam => !exam.attemptedBy.some(id => id.equals(studentObjId))
+  );
+  const completedExams = exams.filter(
+    exam => exam.attemptedBy.some(id => id.equals(studentObjId))
+  );
+
+  res.json({
+    success: true,
+    message: "User exams fetched successfully",
+    data: { ongoingExams, completedExams },
+  });
+}));
+
+// Get exam by ID - OPTIMIZED
+router.post("/get-exam-by-id", authenticateToken, asyncHandler(async (req, res) => {
+  const { examId } = req.body;
+
+  if (!examId || !mongoose.Types.ObjectId.isValid(examId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid exam ID" 
     });
   }
-});
 
-// add question to exam
+  const exam = await Exam.findById(examId)
+    .populate({
+      path: "questions",
+      select: "questionText options correctAnswer difficulty marks",
+      options: { lean: true }
+    })
+    .lean();
 
-router.post("/add-question-to-exam", authenticateToken, async (req, res) => {
-  try {
-    // add question to Questions collection
-    const newQuestion = new Question(req.body);
-    const question = await newQuestion.save();
-
-    // add question to exam
-    const exam = await Exam.findById(req.body.exam);
-    exam.questions.push(question._id);
-    await exam.save();
-    res.send({
-      message: "Question added successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  if (!exam) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Exam not found" 
     });
   }
-});
 
-// edit question in exam
-router.post("/edit-question-in-exam", authenticateToken, async (req, res) => {
-  try {
-    // edit question in Questions collection
-    await Question.findByIdAndUpdate(req.body.questionId, req.body);
-    res.send({
-      message: "Question edited successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  res.json({
+    success: true,
+    message: "Exam fetched successfully",
+    data: exam,
+  });
+}));
+
+// Edit exam - OPTIMIZED
+router.post("/edit-exam-by-id", authenticateToken, asyncHandler(async (req, res) => {
+  const { examId, ...updates } = req.body;
+
+  if (!examId || !mongoose.Types.ObjectId.isValid(examId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid exam ID" 
     });
   }
-});
 
-// delete question in exam
-router.post("/delete-question-in-exam", authenticateToken, async (req, res) => {
-  try {
-    // delete question in Questions collection
-    await Question.findByIdAndDelete(req.body.questionId);
+  const exam = await Exam.findByIdAndUpdate(examId, updates, { 
+    new: true, 
+    runValidators: true 
+  });
 
-    // delete question in exam
-    const exam = await Exam.findById(req.body.examId);
-    exam.questions = exam.questions.filter(
-      (question) => question._id != req.body.questionId
-    );
-    await exam.save();
-    res.send({
-      message: "Question deleted successfully",
-      success: true,
-    });
-  } catch (error) {
-    res.status(500).send({
-      message: error.message,
-      data: error,
-      success: false,
+  if (!exam) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Exam not found" 
     });
   }
-});
+
+  res.json({
+    success: true,
+    message: "Exam updated successfully",
+    data: exam,
+  });
+}));
+
+// Delete exam - OPTIMIZED
+router.post("/delete-exam-by-id", authenticateToken, asyncHandler(async (req, res) => {
+  const { examId } = req.body;
+
+  if (!examId || !mongoose.Types.ObjectId.isValid(examId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid exam ID" 
+    });
+  }
+
+  const exam = await Exam.findByIdAndDelete(examId);
+
+  if (!exam) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Exam not found" 
+    });
+  }
+
+  res.json({
+    success: true,
+    message: "Exam deleted successfully",
+  });
+}));
+
+// Add question to exam
+router.post("/add-question-to-exam", authenticateToken, asyncHandler(async (req, res) => {
+  const { exam: examId, ...questionData } = req.body;
+
+  if (!examId || !mongoose.Types.ObjectId.isValid(examId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid exam ID" 
+    });
+  }
+
+  const newQuestion = new Question(questionData);
+  await newQuestion.save();
+
+  const exam = await Exam.findByIdAndUpdate(
+    examId,
+    { $push: { questions: newQuestion._id } },
+    { new: true }
+  );
+
+  if (!exam) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Exam not found" 
+    });
+  }
+
+  res.status(201).json({
+    success: true,
+    message: "Question added successfully",
+    data: newQuestion,
+  });
+}));
+
+// Edit question in exam
+router.post("/edit-question-in-exam", authenticateToken, asyncHandler(async (req, res) => {
+  const { questionId, ...updates } = req.body;
+
+  if (!questionId || !mongoose.Types.ObjectId.isValid(questionId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid question ID" 
+    });
+  }
+
+  const question = await Question.findByIdAndUpdate(questionId, updates, { 
+    new: true,
+    runValidators: true 
+  });
+
+  if (!question) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Question not found" 
+    });
+  }
+
+  res.json({
+    success: true,
+    message: "Question updated successfully",
+    data: question,
+  });
+}));
+
+// Delete question from exam
+router.post("/delete-question-in-exam", authenticateToken, asyncHandler(async (req, res) => {
+  const { questionId, examId } = req.body;
+
+  if (!questionId || !examId || 
+      !mongoose.Types.ObjectId.isValid(questionId) ||
+      !mongoose.Types.ObjectId.isValid(examId)) {
+    return res.status(400).json({ 
+      success: false, 
+      message: "Invalid IDs" 
+    });
+  }
+
+  await Question.findByIdAndDelete(questionId);
+
+  const exam = await Exam.findByIdAndUpdate(
+    examId,
+    { $pull: { questions: questionId } },
+    { new: true }
+  );
+
+  if (!exam) {
+    return res.status(404).json({ 
+      success: false, 
+      message: "Exam not found" 
+    });
+  }
+
+  res.json({
+    success: true,
+    message: "Question deleted successfully",
+  });
+}));
 
 // add user to attemptedBy field in exam
 router.post("/attempt-exam", authenticateToken, async (req, res) => {

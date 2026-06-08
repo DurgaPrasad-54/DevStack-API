@@ -19,8 +19,6 @@ const checkMentorRole = async (req, res, next) => {
     }
 };
 
-module.exports = { checkMentorRole };
-
 
 // Get all teams without mentors (for mentors only)
 router.get('/available-teams', authenticateToken, checkMentorRole, async (req, res) => {

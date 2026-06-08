@@ -211,12 +211,23 @@ router.get('/join-requests', authenticateStudentToken, async (req, res) => {
       return res.json([]);
     }
 
+    // Find teams where user is the team lead (by registration ID)
     const teamsLed = await HackTeams.find({ teamLead: studentRegEntry._id });
     const teamIds = teamsLed.map(t => t._id);
-    const requests = await TeamJoinRequest.find({ teamId: { $in: teamIds }, status: 'pending' })
+    
+    // Query join requests by:
+    // 1. Teams they lead (by teamId)
+    // 2. Direct recipient (by student ID) - in case recipient is stored differently
+    const requests = await TeamJoinRequest.find({ 
+      $or: [
+        { teamId: { $in: teamIds }, status: 'pending' },
+        { recipient: req.studentId, status: 'pending' }
+      ]
+    })
       .populate('sender', 'name')
       .populate('teamId', 'name');
-    logRoute('GET /join-requests result', { count: requests.length });
+    
+    logRoute('GET /join-requests result', { count: requests.length, userStudentId: req.studentId, teamsLedCount: teamIds.length });
     res.json(requests);
   } catch (err) {
     console.error('Error /join-requests:', err);

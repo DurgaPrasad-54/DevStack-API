@@ -1,225 +1,288 @@
-const express = require('express');
+﻿const express = require('express');
 const router = express.Router();
-const Event = require('../models/event'); // Ensure the correct path
-const { authenticateToken, requireRole } = require('../middleware/auth'); // Adjust path as needed
+const mongoose = require('mongoose');
+const Event = require('../models/event');
+const { authenticateToken, requireRole } = require('../middleware/auth');
+const { asyncHandler, AppError } = require('../utils/errorHandler');
 
-// GET all events (filtered by user role)
-router.get('/events', authenticateToken, async (req, res) => {
-    try {
-        const userRole = req.user.role;
-        let filter = {};
+const VALID_RECIPIENTS = ['all', 'student', 'mentor', 'admin'];
 
-        // Filter events based on user role
-        if (userRole === 'student') {
-            filter = { recipients: { $in: ['all', 'student'] } };
-        } else if (userRole === 'mentor') {
-            filter = { recipients: { $in: ['all', 'mentor'] } };
-        } else if (userRole === 'admin') {
-            filter = { recipients: { $in: ['all', 'admin'] } }; // Admins see 'all' and 'admin'
-        } else {
-            filter = { recipients: 'all' };
+// Middleware to build role-based filter
+const getRoleFilter = (role) => {
+  const filterMap = {
+    student: { recipients: { $in: ['all', 'student'] } },
+    mentor: { recipients: { $in: ['all', 'mentor'] } },
+    admin: { recipients: { $in: ['all', 'admin'] } },
+    default: { recipients: 'all' }
+  };
+  return filterMap[role] || filterMap.default;
+};
+
+// GET all events (filtered by user role) - OPTIMIZED
+router.get('/events', authenticateToken, asyncHandler(async (req, res) => {
+  const { role } = req.user;
+  const roleFilter = getRoleFilter(role);
+
+  const events = await Event.find(roleFilter)
+    .select('title date description meeting recipients createdBy createdAt')
+    .sort({ date: 1, createdAt: 1 })
+    .lean()
+    .limit(1000);
+
+  res.json({
+    success: true,
+    message: 'Events fetched successfully',
+    data: events,
+  });
+}));
+
+// GET all events for admin (no filtering) - OPTIMIZED
+router.get('/admin', authenticateToken, requireRole(['admin']), asyncHandler(async (req, res) => {
+  const events = await Event.find({})
+    .select('title date description meeting recipients createdBy createdByRole createdAt updatedAt')
+    .sort({ date: 1, createdAt: 1 })
+    .lean()
+    .limit(1000);
+
+  res.json({
+    success: true,
+    message: 'All events fetched (admin)',
+    data: events,
+  });
+}));
+
+// GET events by date - OPTIMIZED
+router.get('/date/:date', authenticateToken, asyncHandler(async (req, res) => {
+  const { role } = req.user;
+  const { date } = req.params;
+
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid date format. Use YYYY-MM-DD'
+    });
+  }
+
+  const filter = { date };
+  
+  if (role !== 'admin') {
+    Object.assign(filter, getRoleFilter(role));
+  }
+
+  const events = await Event.find(filter)
+    .select('title date description meeting recipients createdBy createdAt')
+    .sort({ createdAt: 1 })
+    .lean();
+
+  if (!events || events.length === 0) {
+    return res.status(404).json({
+      success: false,
+      message: 'No events found for this date'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Events fetched for date',
+    data: events,
+  });
+}));
+
+// POST new event (admin only) - OPTIMIZED
+router.post('/', authenticateToken, requireRole(['admin']), asyncHandler(async (req, res) => {
+  const { title, date, description, meeting, recipients } = req.body;
+
+  // Validation
+  if (!title || !title.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Title is required'
+    });
+  }
+
+  if (!description || !description.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Description is required'
+    });
+  }
+
+  if (!date) {
+    return res.status(400).json({
+      success: false,
+      message: 'Date is required'
+    });
+  }
+
+  if (recipients && !VALID_RECIPIENTS.includes(recipients)) {
+    return res.status(400).json({
+      success: false,
+      message: `Invalid recipients. Must be one of: ${VALID_RECIPIENTS.join(', ')}`
+    });
+  }
+
+  const newEvent = new Event({
+    title: title.trim(),
+    date,
+    description: description.trim(),
+    meeting: meeting ? meeting.trim() : '',
+    recipients: recipients || 'all',
+    createdBy: req.user.userId,
+    createdByRole: req.user.role,
+    createdAt: new Date()
+  });
+
+  await newEvent.save();
+
+  res.status(201).json({
+    success: true,
+    message: 'Event created successfully',
+    data: newEvent,
+  });
+}));
+
+// PUT update event by ID (admin only) - OPTIMIZED
+router.put('/:id', authenticateToken, requireRole(['admin']), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { title, description, meeting, recipients } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid event ID'
+    });
+  }
+
+  // Validation
+  if (title && !title.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Title cannot be empty'
+    });
+  }
+
+  if (description && !description.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Description cannot be empty'
+    });
+  }
+
+  if (recipients && !VALID_RECIPIENTS.includes(recipients)) {
+    return res.status(400).json({
+      success: false,
+      message: `Invalid recipients. Must be one of: ${VALID_RECIPIENTS.join(', ')}`
+    });
+  }
+
+  const updateData = {};
+  if (title) updateData.title = title.trim();
+  if (description) updateData.description = description.trim();
+  if (meeting) updateData.meeting = meeting.trim();
+  if (recipients) updateData.recipients = recipients;
+  updateData.updatedBy = req.user.userId;
+  updateData.updatedAt = new Date();
+
+  const updatedEvent = await Event.findByIdAndUpdate(id, updateData, {
+    new: true,
+    runValidators: true
+  });
+
+  if (!updatedEvent) {
+    return res.status(404).json({
+      success: false,
+      message: 'Event not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Event updated successfully',
+    data: updatedEvent,
+  });
+}));
+
+// DELETE event by ID (admin only) - OPTIMIZED
+router.delete('/:id', authenticateToken, requireRole(['admin']), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid event ID'
+    });
+  }
+
+  const deletedEvent = await Event.findByIdAndDelete(id);
+
+  if (!deletedEvent) {
+    return res.status(404).json({
+      success: false,
+      message: 'Event not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Event deleted successfully',
+  });
+}));
+
+// GET event statistics (admin only) - OPTIMIZED with aggregation
+router.get('/stats/all', authenticateToken, requireRole(['admin']), asyncHandler(async (req, res) => {
+  const [totalEvents, eventsByRecipient, upcomingEvents] = await Promise.all([
+    Event.countDocuments(),
+    Event.aggregate([
+      {
+        $group: {
+          _id: '$recipients',
+          count: { $sum: 1 }
         }
+      },
+      { $sort: { count: -1 } }
+    ]),
+    Event.countDocuments({
+      date: { $gte: new Date().toISOString().split('T')[0] }
+    })
+  ]);
 
-        const events = await Event.find(filter).sort({ date: 1, createdAt: 1 });
-        res.status(200).json(events);
-        console.log(`Events fetched for ${userRole} user:`, events); // Debug log
-    } catch (error) {
-        console.error('Error fetching events:', error);
-        res.status(500).json({ message: 'Server error' });
+  res.json({
+    success: true,
+    message: 'Event statistics retrieved',
+    data: {
+      totalEvents,
+      eventsByRecipient,
+      upcomingEvents,
+      pastEvents: totalEvents - upcomingEvents
     }
-});
+  });
+}));
 
-// GET all events for admin (no filtering) - separate endpoint for admin panel
-router.get('/events/admin', authenticateToken, requireRole(['admin']), async (req, res) => {
-    try {
-        const events = await Event.find().sort({ date: 1, createdAt: 1 });
-        res.status(200).json(events);
-    } catch (error) {
-        console.error('Error fetching events:', error);
-        res.status(500).json({ message: 'Server error' });
-    }
-});
+// GET single event by ID - OPTIMIZED
+router.get('/:id', authenticateToken, asyncHandler(async (req, res) => {
+  const { id } = req.params;
 
-// GET events by date (for specific date queries) - Now returns array of events
-router.get('/events/date/:date', authenticateToken, async (req, res) => {
-    try {
-        const userRole = req.user.role;
-        const targetDate = req.params.date;
-        
-        let filter = { date: targetDate };
-        
-        // Apply role-based filtering
-        if (userRole === 'student') {
-            filter.recipients = { $in: ['all', 'student'] };
-        } else if (userRole === 'mentor') {
-            filter.recipients = { $in: ['all', 'mentor'] };
-        } else if (userRole !== 'admin') {
-            filter.recipients = 'all';
-        }
-        
-        const events = await Event.find(filter).sort({ createdAt: 1 });
-        
-        if (!events || events.length === 0) {
-            return res.status(404).json({ message: 'No events found for this date' });
-        }
-        
-        res.status(200).json(events);
-    } catch (error) {
-        console.error('Error fetching events by date:', error);
-        res.status(500).json({ message: 'Server error' });
-    }
-});
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid event ID'
+    });
+  }
 
-// POST new event (admin and mentor only)
-router.post('/events', authenticateToken, requireRole(['admin']), async (req, res) => {
-    try {
-        const { title, date, description, meeting, recipients } = req.body;
-        
-        // Validation
-        const errors = {};
-        if (!title || !title.trim()) {
-            errors.title = 'Title is required';
-        }
-        if (!description || !description.trim()) {
-            errors.description = 'Description is required';
-        }
-        if (!date) {
-            errors.date = 'Date is required';
-        }
-        
-        // Validate recipients
-        const validRecipients = ['all', 'student', 'mentor', 'admin'];
-        if (recipients && !validRecipients.includes(recipients)) {
-            errors.recipients = 'Invalid recipients value. Must be one of: all, student, mentor, admin';
-        }
-        
-        if (Object.keys(errors).length > 0) {
-            return res.status(400).json({ errors });
-        }
-        
-        // No longer check for existing events on the same date since we allow multiple events
-        
-        const newEvent = new Event({
-            title: title.trim(),
-            date,
-            description: description.trim(),
-            meeting: meeting ? meeting.trim() : '',
-            recipients: recipients || 'all', // Store recipients
-            createdBy: req.user.id, // Track who created the event
-            createdByRole: req.user.role, // Store the role of creator
-            createdAt: new Date()
-        });
-        
-        const savedEvent = await newEvent.save();
-        console.log(`Event created by ${req.user.role} user:`, savedEvent); // Debug log
-        
-        res.status(201).json(savedEvent);
-    } catch (error) {
-        console.error('Error saving event:', error);
-        res.status(400).json({ message: 'Error saving event' });
-    }
-});
+  const event = await Event.findById(id).lean();
 
-// PUT update event by ID (admin and mentor only)
-router.put('/events/:id', authenticateToken, requireRole(['admin']), async (req, res) => {
-    try {
-        const { title, description, meeting, recipients } = req.body;
-        const eventId = req.params.id;
-        
-        // Validation
-        const errors = {};
-        if (!title || !title.trim()) {
-            errors.title = 'Title is required';
-        }
-        if (!description || !description.trim()) {
-            errors.description = 'Description is required';
-        }
-        
-        // Validate recipients
-        const validRecipients = ['all', 'student', 'mentor', 'admin'];
-        if (recipients && !validRecipients.includes(recipients)) {
-            errors.recipients = 'Invalid recipients value. Must be one of: all, student, mentor, admin';
-        }
-        
-        if (Object.keys(errors).length > 0) {
-            return res.status(400).json({ errors });
-        }
-        
-        const updatedEvent = await Event.findByIdAndUpdate(
-            eventId,
-            {
-                title: title.trim(),
-                description: description.trim(),
-                meeting: meeting ? meeting.trim() : '',
-                recipients: recipients || 'all',
-                updatedBy: req.user.id, // Track who updated the event
-                updatedAt: new Date()
-            },
-            { new: true }
-        );
-        
-        if (!updatedEvent) {
-            return res.status(404).json({ message: 'Event not found' });
-        }
-        
-        console.log(`Event updated by ${req.user.role} user:`, updatedEvent); // Debug log
-        
-        res.status(200).json(updatedEvent);
-    } catch (error) {
-        console.error('Error updating event:', error);
-        res.status(400).json({ message: 'Error updating event' });
-    }
-});
+  if (!event) {
+    return res.status(404).json({
+      success: false,
+      message: 'Event not found'
+    });
+  }
 
-// DELETE event by ID (admin and mentor only)
-router.delete('/events/:id', authenticateToken, requireRole(['admin']), async (req, res) => {
-    try {
-        const eventId = req.params.id;
-        
-        const deletedEvent = await Event.findByIdAndDelete(eventId);
-        
-        if (!deletedEvent) {
-            return res.status(404).json({ message: 'Event not found' });
-        }
-        
-        console.log(`Event deleted by ${req.user.role} user:`, deletedEvent); // Debug log
-        
-        res.status(200).json({ 
-            message: 'Event deleted successfully',
-            deletedEvent: deletedEvent 
-        });
-    } catch (error) {
-        console.error('Error deleting event:', error);
-        res.status(500).json({ message: 'Error deleting event' });
-    }
-});
-
-// GET events statistics (admin only)
-router.get('/events/stats', authenticateToken, requireRole(['admin']), async (req, res) => {
-    try {
-        const totalEvents = await Event.countDocuments();
-        const eventsByRecipient = await Event.aggregate([
-            {
-                $group: {
-                    _id: '$recipients',
-                    count: { $sum: 1 }
-                }
-            }
-        ]);
-        
-        const upcomingEvents = await Event.countDocuments({
-            date: { $gte: new Date().toISOString().split('T')[0] }
-        });
-        
-        res.status(200).json({
-            totalEvents,
-            eventsByRecipient,
-            upcomingEvents
-        });
-    } catch (error) {
-        console.error('Error fetching event statistics:', error);
-        res.status(500).json({ message: 'Server error' });
-    }
-});
+  res.json({
+    success: true,
+    message: 'Event retrieved successfully',
+    data: event,
+  });
+}));
 
 module.exports = router;

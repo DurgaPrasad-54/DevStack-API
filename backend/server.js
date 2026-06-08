@@ -36,15 +36,35 @@ const maincertificate = require('./routes/main-certificates');
 const promotingStudents = require('./routes/promotingstudents');
 const mentorEvents = require('./routes/mentorevents');
 const Adminresourceapproval = require('./routes/resouresapprovalbyadmin');
-// const secondYearRequest = require('./routes/secondyearrequest');
+const secondYearRequest = require('./routes/secondyearrequest');
 const hackathon = require("./Devstack/routes/Adminhackathon");
-const HackNotification = require('./Devstack/Models/HackNotification');
+const HackNotification = require('./Devstack/models/HackNotification');
 const { startHackathonStatusScheduler } = require('./Devstack/scheduler/hackathonStatusScheduler');
 const app = express();
 const server = http.createServer(app);
+
+// CORS origin checker to allow all ports on localhost/127.0.0.1
+const checkOrigin = (origin, callback) => {
+  const allowedOrigins = [
+    process.env.FRONTEND_URL || 'http://localhost:3000',
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ];
+
+  const isLocalhost = origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+
+  if (!origin || allowedOrigins.includes(origin) || isLocalhost) {
+    callback(null, true);
+  } else if (process.env.NODE_ENV !== 'production') {
+    callback(null, true); // Allow all in development
+  } else {
+    callback(new Error('CORS not allowed'));
+  }
+};
+
 const io = new Server(server, {
   cors: {
-    origin: '*', // Allow all origins for WebSocket
+    origin: checkOrigin,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type'],
     credentials: true,
@@ -56,7 +76,7 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ limit: '20mb', extended: true }));
 app.use(
   cors({
-    origin: '*', // Allow all origins
+    origin: checkOrigin,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'],
     credentials: true,
     allowedHeaders: ['Content-Type', 'Authorization'],
@@ -164,30 +184,30 @@ io.on('connection', (socket) => {
     }
   });
   socket.on('markAsRead', async (notificationId) => {
-  try {
-    await HackNotification.findByIdAndUpdate(notificationId, {
-      $addToSet: { readBy: socket.userId }
-    });
+    try {
+      await HackNotification.findByIdAndUpdate(notificationId, {
+        $addToSet: { readBy: socket.userId }
+      });
 
-    // Optionally notify only that user
-    io.to(socket.userId).emit('notificationRead', { notificationId });
-  } catch (error) {
-    console.error('Error marking notification as read:', error);
-  }
-});
-socket.on('markHackAsRead', async (hackNotificationId) => {
-  try {
-    await HackNotification.findByIdAndUpdate(hackNotificationId, {
-      $addToSet: { readBy: socket.userId }
-    });
+      // Optionally notify only that user
+      io.to(socket.userId).emit('notificationRead', { notificationId });
+    } catch (error) {
+      console.error('Error marking notification as read:', error);
+    }
+  });
+  socket.on('markHackAsRead', async (hackNotificationId) => {
+    try {
+      await HackNotification.findByIdAndUpdate(hackNotificationId, {
+        $addToSet: { readBy: socket.userId }
+      });
 
-    // Notify only this user
-    io.to(socket.userId).emit('hackNotificationRead', { hackNotificationId });
-  } catch (error) {
-    console.error('Error marking hackathon notification as read:', error);
-    socket.emit('error', { message: error.message });
-  }
-});
+      // Notify only this user
+      io.to(socket.userId).emit('hackNotificationRead', { hackNotificationId });
+    } catch (error) {
+      console.error('Error marking hackathon notification as read:', error);
+      socket.emit('error', { message: error.message });
+    }
+  });
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.userId}`);
 
@@ -231,13 +251,13 @@ app.use('/feedback', require('./routes/feedback'));
 app.use('/mentorevents', mentorEvents);
 app.use('/mentorresources', require('./routes/mentorresources'));
 app.use('/admin-approvals', Adminresourceapproval);
-// app.use('/secondyear-change', secondYearRequest);
+app.use('/secondyear-change', secondYearRequest);
 app.use("/hackathon", hackathon);
 app.use('/hacknotifications', require('./Devstack/routes/HackNotification'));
 // app.use("/uploads", express.static(path.join(__dirname, "uploads")));
- app.use('/roomallocation', require('./Devstack/routes/roomallocation'));
- app.use('/schedule', require('./Devstack/routes/schedule'));
- app.use('/hackreg', require('./Devstack/routes/hack-reg'));
+app.use('/roomallocation', require('./Devstack/routes/roomallocation'));
+app.use('/schedule', require('./Devstack/routes/schedule'));
+app.use('/hackreg', require('./Devstack/routes/hack-reg'));
 app.use('/hackitems', require('./Devstack/routes/Hackitems'));
 app.use('/hacknotes', require('./Devstack/routes/Hacknotes'));
 app.use('/hackvideos', require('./Devstack/routes/Hackvideos'));

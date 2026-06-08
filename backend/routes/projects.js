@@ -1,9 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const mongoose = require('mongoose');
 const Project = require('../models/projects');
+const { authenticateToken } = require('../middleware/auth');
+const { asyncHandler, AppError } = require('../utils/errorHandler');
 
-// Configure multer for memory storage
+// Configure multer for memory storage with validation
 const storage = multer.memoryStorage();
 const upload = multer({
   storage,
@@ -17,110 +20,214 @@ const upload = multer({
     if (mimetype) {
       return cb(null, true);
     }
-    cb(new Error('Only image files (jpeg, jpg, png, webp) are allowed!'));
+    cb(new Error('Only image files (jpeg, jpg, png, webp) are allowed'));
   }
 });
 
-// Create new project
-router.post('/', upload.single('thumbnail'), async (req, res) => {
-  try {
-    const { title, description, githubLink, youtubeLink } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'Thumbnail is required' });
-    }
+// Create new project - OPTIMIZED
+router.post('/', authenticateToken, upload.single('thumbnail'), asyncHandler(async (req, res) => {
+  const { title, description, githubLink, youtubeLink, teamId } = req.body;
 
-    const project = new Project({
-      title,
-      description,
-      thumbnail: {
-        data: req.file.buffer,
-        contentType: req.file.mimetype
-      },
-      githubLink,
-      youtubeLink
+  if (!title) {
+    return res.status(400).json({
+      success: false,
+      message: 'Title is required'
     });
+  }
 
-    await project.save();
-    res.status(201).json({
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      message: 'Thumbnail is required'
+    });
+  }
+
+  const project = new Project({
+    title,
+    description,
+    thumbnail: {
+      data: req.file.buffer,
+      contentType: req.file.mimetype
+    },
+    githubLink,
+    youtubeLink,
+    teamId,
+    createdBy: req.user.userId,
+  });
+
+  await project.save();
+
+  res.status(201).json({
+    success: true,
+    message: 'Project created successfully',
+    data: {
       _id: project._id,
       title: project.title,
       description: project.description,
       githubLink: project.githubLink,
       youtubeLink: project.youtubeLink,
-      createdAt: project.createdAt
-    });
-  } catch (error) {
-    res.status(400).json({ error: error.message });
-  }
-});
+      createdAt: project.createdAt,
+    }
+  });
+}));
 
-// Get all projects
-router.get('/', async (req, res) => {
-  try {
-    const projects = await Project.find()
+// Get all projects - OPTIMIZED
+router.get('/', asyncHandler(async (req, res) => {
+  const { teamId, page = 1, limit = 20 } = req.query;
+
+  const query = {};
+  if (teamId && mongoose.Types.ObjectId.isValid(teamId)) {
+    query.teamId = teamId;
+  }
+
+  const skip = (page - 1) * limit;
+
+  const [projects, total] = await Promise.all([
+    Project.find(query)
       .select('-thumbnail.data')
-      .sort({ createdAt: -1 });
-    res.json(projects);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean(),
+    Project.countDocuments(query)
+  ]);
 
-// Get project thumbnail
-router.get('/:id/thumbnail', async (req, res) => {
-  try {
-    const project = await Project.findById(req.params.id).select('thumbnail');
-    if (!project || !project.thumbnail) {
-      return res.status(404).json({ error: 'Thumbnail not found' });
+  res.json({
+    success: true,
+    data: projects,
+    pagination: {
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+      pages: Math.ceil(total / limit)
     }
-    
-    res.set('Content-Type', project.thumbnail.contentType);
-    res.send(project.thumbnail.data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  });
+}));
+
+// Get project by ID - OPTIMIZED
+router.get('/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid project ID'
+    });
   }
-});
 
-// Update project
-router.put('/:id', upload.single('thumbnail'), async (req, res) => {
-  try {
-    const updates = req.body;
-    
-    if (req.file) {
-      updates.thumbnail = {
-        data: req.file.buffer,
-        contentType: req.file.mimetype
-      };
-    }
+  const project = await Project.findById(id)
+    .select('-thumbnail.data')
+    .lean();
 
-    const project = await Project.findByIdAndUpdate(
-      req.params.id, 
-      updates,
-      { new: true, runValidators: true }
-    ).select('-thumbnail.data');
-
-    if (!project) {
-      return res.status(404).json({ error: 'Project not found' });
-    }
-
-    res.json(project);
-  } catch (error) {
-    res.status(400).json({ error: error.message });
+  if (!project) {
+    return res.status(404).json({
+      success: false,
+      message: 'Project not found'
+    });
   }
-});
 
-// Delete project
-router.delete('/:id', async (req, res) => {
-  try {
-    const project = await Project.findByIdAndDelete(req.params.id);
-    if (!project) {
-      return res.status(404).json({ error: 'Project not found' });
-    }
-    res.json({ message: 'Project deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  res.json({
+    success: true,
+    data: project
+  });
+}));
+
+// Get project thumbnail - OPTIMIZED
+router.get('/:id/thumbnail', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid project ID'
+    });
   }
-});
+
+  const project = await Project.findById(id)
+    .select('thumbnail')
+    .lean();
+
+  if (!project || !project.thumbnail) {
+    return res.status(404).json({
+      success: false,
+      message: 'Thumbnail not found'
+    });
+  }
+
+  res.set('Content-Type', project.thumbnail.contentType);
+  res.set('Cache-Control', 'public, max-age=604800'); // Cache for 1 week
+  res.send(project.thumbnail.data);
+}));
+
+// Update project - OPTIMIZED
+router.put('/:id', authenticateToken, upload.single('thumbnail'), asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { title, description, githubLink, youtubeLink } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid project ID'
+    });
+  }
+
+  const project = await Project.findById(id);
+  if (!project) {
+    return res.status(404).json({
+      success: false,
+      message: 'Project not found'
+    });
+  }
+
+  // Update fields
+  if (title) project.title = title;
+  if (description) project.description = description;
+  if (githubLink) project.githubLink = githubLink;
+  if (youtubeLink) project.youtubeLink = youtubeLink;
+
+  if (req.file) {
+    project.thumbnail = {
+      data: req.file.buffer,
+      contentType: req.file.mimetype
+    };
+  }
+
+  project.updatedAt = new Date();
+  await project.save();
+
+  const response = project.toObject();
+  delete response.thumbnail.data;
+
+  res.json({
+    success: true,
+    message: 'Project updated successfully',
+    data: response
+  });
+}));
+
+// Delete project - OPTIMIZED
+router.delete('/:id', authenticateToken, asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid project ID'
+    });
+  }
+
+  const project = await Project.findByIdAndDelete(id);
+  if (!project) {
+    return res.status(404).json({
+      success: false,
+      message: 'Project not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Project deleted successfully'
+  });
+}));
 
 module.exports = router;

@@ -3,347 +3,457 @@ const router = express.Router();
 const { Student, Mentor } = require('../models/roles');
 const mongoose = require('mongoose');
 const { authenticateToken } = require('../middleware/auth');
+const { asyncHandler, AppError } = require('../utils/errorHandler');
 const Team = require('../models/teams');
 
-// Add this constant at the top of your routes file
 const MAX_TEAM_SIZE = 4;
 
-// Update the myteam route
-router.get('/myteam', authenticateToken, async (req, res) => {
-  try {
-    const { userId, role } = req.user;
+// Get my team - OPTIMIZED
+router.get('/myteam', authenticateToken, asyncHandler(async (req, res) => {
+  const { userId } = req.user;
 
-    const team = await Team.findOne({
-      students: userId,
-    }).populate('mentor', 'name email');
+  const team = await Team.findOne({ students: userId })
+    .populate('mentor', 'name email')
+    .populate('students', 'name email rollNo')
+    .populate('teamLead', 'name email rollNo')
+    .lean();
 
-    // Debug log
-    console.log('Found team:', team);
-
-    if (!team) {
-      return res.status(404).json({ message: 'No team found' });
-    }
-
-    // Make sure to send the full team data
-    res.json({
-      _id: team._id,
-      name: team.name,
-      mentor: team.mentor,
-      students: team.students,
-    });
-  } catch (error) {
-    console.error('Error in /myteam route:', error);
-    res.status(500).json({
-      error: 'Failed to fetch team details',
-      details: error.message,
+  if (!team) {
+    return res.status(404).json({ 
+      success: false,
+      message: 'No team found' 
     });
   }
-});
 
-// Search students
-router.get('/students/search', async (req, res) => {
-  try {
-    const { query } = req.query;
-    const students = await Student.find({
-      $or: [
-        { name: { $regex: query, $options: 'i' } },
-        { email: { $regex: query, $options: 'i' } },
-        { rollNo: { $regex: query, $options: 'i' } },
-      ],
-    }).select('_id name email rollNo github');
-    // Check which students are already in a team
-    const studentIds = students.map((student) => student._id);
-    const teams = await Team.find({ students: { $in: studentIds } }).select(
-      'students'
-    );
+  res.json({
+    success: true,
+    data: team,
+  });
+}));
 
-    // Create a set of student IDs that are already in teams
-    const studentsInTeams = new Set(
-      teams.flatMap((team) => team.students.map((id) => id.toString()))
-    );
+// Search students - OPTIMIZED
+router.get('/students/search', asyncHandler(async (req, res) => {
+  const { query } = req.query;
 
-    // Append the "inTeam" field to each student indicating whether they're already in a team
-    const result = students.map((student) => ({
-      ...student.toObject(),
-      inTeam: studentsInTeams.has(student._id.toString()),
-    }));
-
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to search students' });
+  if (!query || query.trim().length < 2) {
+    return res.status(400).json({
+      success: false,
+      message: 'Query must be at least 2 characters'
+    });
   }
-});
 
-// Search mentors
-router.get('/mentors/search', async (req, res) => {
-  try {
-    const { query } = req.query;
-    const mentors = await Mentor.find({
-      $or: [
-        { name: { $regex: query, $options: 'i' } },
-        { email: { $regex: query, $options: 'i' } },
-      ],
-    }).select('_id name email github');
-    res.json(mentors);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to search mentors' });
+  // Single consolidated query with regex
+  const students = await Student.find({
+    $or: [
+      { name: { $regex: query, $options: 'i' } },
+      { email: { $regex: query, $options: 'i' } },
+      { rollNo: { $regex: query, $options: 'i' } },
+    ],
+  })
+    .select('_id name email rollNo github')
+    .lean()
+    .limit(50);
+
+  // Get teams for these students in one query
+  const studentIds = students.map(s => s._id);
+  const teams = await Team.find({ students: { $in: studentIds } })
+    .select('students')
+    .lean();
+
+  const studentsInTeamsSet = new Set(
+    teams.flatMap(team => team.students.map(id => id.toString()))
+  );
+
+  const result = students.map(student => ({
+    ...student,
+    inTeam: studentsInTeamsSet.has(student._id.toString()),
+  }));
+
+  res.json({
+    success: true,
+    data: result,
+  });
+}));
+
+// Search mentors - OPTIMIZED
+router.get('/mentors/search', asyncHandler(async (req, res) => {
+  const { query } = req.query;
+
+  if (!query || query.trim().length < 2) {
+    return res.status(400).json({
+      success: false,
+      message: 'Query must be at least 2 characters'
+    });
   }
-});
 
-// Create a team from admin
-router.post('/', async (req, res) => {
-  try {
-    const { name, studentIds, mentorId } = req.body;
+  const mentors = await Mentor.find({
+    $or: [
+      { name: { $regex: query, $options: 'i' } },
+      { email: { $regex: query, $options: 'i' } },
+    ],
+  })
+    .select('_id name email github')
+    .lean()
+    .limit(50);
 
-    // Check team size
-    if (studentIds.length > MAX_TEAM_SIZE) {
+  res.json({
+    success: true,
+    data: mentors,
+  });
+}));
+
+// Create a team (admin) - OPTIMIZED
+router.post('/', asyncHandler(async (req, res) => {
+  const { name, studentIds, mentorId } = req.body;
+
+  // Validation
+  if (!name || !studentIds || studentIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'Team name and at least one student are required'
+    });
+  }
+
+  if (studentIds.length > MAX_TEAM_SIZE) {
+    return res.status(400).json({
+      success: false,
+      message: `Team size cannot exceed ${MAX_TEAM_SIZE} members`
+    });
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(mentorId)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid mentor ID'
+    });
+  }
+
+  for (const id of studentIds) {
+    if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
-        error: `Team size cannot exceed ${MAX_TEAM_SIZE} members`,
+        success: false,
+        message: 'Invalid student ID'
       });
     }
+  }
 
-    // Rest of your existing validation logic...
-    const existingTeam = await Team.findOne({ name });
-    if (existingTeam) {
-      return res.status(400).json({ error: 'Team name already exists' });
-    }
+  // Check team name uniqueness
+  const existingTeam = await Team.findOne({ name }).lean();
+  if (existingTeam) {
+    return res.status(409).json({
+      success: false,
+      message: 'Team name already exists'
+    });
+  }
 
-    const students = await Student.find({ _id: { $in: studentIds } });
-    if (students.length !== studentIds.length) {
-      return res
-        .status(400)
-        .json({ error: 'One or more selected students do not exist' });
-    }
+  // Verify students exist
+  const students = await Student.find({ _id: { $in: studentIds } })
+    .select('_id')
+    .lean();
+  if (students.length !== studentIds.length) {
+    return res.status(400).json({
+      success: false,
+      message: 'One or more selected students do not exist'
+    });
+  }
 
-    const studentsInTeam = await Team.find({ students: { $in: studentIds } });
-    if (studentsInTeam.length > 0) {
-      const conflictingStudents = students.filter((s) =>
-        studentsInTeam.some((team) => team.students.includes(s._id))
-      );
-      return res.status(400).json({
-        error: 'One or more students are already in a team',
-        conflictingStudents: conflictingStudents.map((s) => ({
-          name: s.name,
-          rollNo: s.rollNo,
-        })),
-      });
-    }
+  // Check if students are already in teams
+  const teamsWithStudents = await Team.find({ students: { $in: studentIds } })
+    .select('students')
+    .lean();
+  
+  if (teamsWithStudents.length > 0) {
+    return res.status(409).json({
+      success: false,
+      message: 'One or more students are already in a team'
+    });
+  }
 
-    const mentor = await Mentor.findById(mentorId);
+  // Verify mentor exists
+  const mentor = await Mentor.findById(mentorId).select('_id').lean();
+  if (!mentor) {
+    return res.status(404).json({
+      success: false,
+      message: 'Mentor not found'
+    });
+  }
+
+  // Create team
+  const randomTeamLeadId = studentIds[Math.floor(Math.random() * studentIds.length)];
+  const newTeam = new Team({
+    name,
+    students: studentIds,
+    teamLead: randomTeamLeadId,
+    mentor: mentorId,
+  });
+
+  await newTeam.save();
+
+  // Populate for response
+  await newTeam.populate([
+    { path: 'students', select: 'name email rollNo github' },
+    { path: 'mentor', select: 'name email github' },
+    { path: 'teamLead', select: 'name email rollNo github' }
+  ]);
+
+  res.status(201).json({
+    success: true,
+    message: 'Team created successfully',
+    data: newTeam,
+  });
+}));
+
+// Create a team (mentor) - OPTIMIZED
+router.post('/mentor/teams', asyncHandler(async (req, res) => {
+  const { name, studentIds, mentorId } = req.body;
+
+  if (!name || !studentIds || studentIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'Team name and at least one student are required'
+    });
+  }
+
+  if (studentIds.length > MAX_TEAM_SIZE) {
+    return res.status(400).json({
+      success: false,
+      message: `Team size cannot exceed ${MAX_TEAM_SIZE} members`
+    });
+  }
+
+  // Verify students exist
+  const students = await Student.find({ _id: { $in: studentIds } })
+    .select('_id')
+    .lean();
+  if (students.length !== studentIds.length) {
+    return res.status(400).json({
+      success: false,
+      message: 'One or more selected students do not exist'
+    });
+  }
+
+  // Check if students are already in teams
+  const teamsWithStudents = await Team.find({ students: { $in: studentIds } })
+    .select('students')
+    .lean();
+  
+  if (teamsWithStudents.length > 0) {
+    return res.status(409).json({
+      success: false,
+      message: 'One or more students are already in a team'
+    });
+  }
+
+  // Verify mentor exists (if provided)
+  if (mentorId && !mongoose.Types.ObjectId.isValid(mentorId)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid mentor ID'
+    });
+  }
+
+  if (mentorId) {
+    const mentor = await Mentor.findById(mentorId).select('_id').lean();
     if (!mentor) {
-      return res.status(400).json({ error: 'Selected mentor does not exist' });
+      return res.status(404).json({
+        success: false,
+        message: 'Mentor not found'
+      });
     }
-
-    // Randomly select a team lead from the students
-    const randomIndex = Math.floor(Math.random() * studentIds.length);
-    const randomTeamLeadId = studentIds[randomIndex];
-
-    const newTeam = new Team({
-      name,
-      students: studentIds,
-      teamLead: randomTeamLeadId, // Set the randomly selected team lead
-      mentor: mentorId,
-    });
-
-    await newTeam.save();
-
-    // Update population to include teamLead
-    await newTeam.populate('students', 'name email rollNo github');
-    await newTeam.populate('mentor', 'name email github');
-    await newTeam.populate('teamLead', 'name email rollNo github');
-
-    res.status(201).json(newTeam);
-  } catch (error) {
-    console.error('Team creation error:', error);
-    res.status(500).json({ error: 'Failed to create team' });
   }
-});
-// Create a team from mentor
-router.post('/teams', async (req, res) => {
-  try {
-    const { name, studentIds, mentorId } = req.body;
 
-    // Validate input
-    if (!name || !studentIds || studentIds.length === 0) {
-      return res
-        .status(400)
-        .json({ error: 'Team name and at least one student are required' });
+  const newTeam = new Team({
+    name,
+    students: studentIds,
+    mentor: mentorId,
+    teamLead: studentIds[0],
+  });
+
+  await newTeam.save();
+  await newTeam.populate([
+    { path: 'students', select: 'name email rollNo github' },
+    { path: 'mentor', select: 'name email github' },
+    { path: 'teamLead', select: 'name email rollNo github' }
+  ]);
+
+  res.status(201).json({
+    success: true,
+    message: 'Team created successfully',
+    data: newTeam,
+  });
+}));
+
+// Get all teams - OPTIMIZED
+router.get('/', asyncHandler(async (req, res) => {
+  const teams = await Team.find()
+    .populate('students', 'name email rollNo github')
+    .populate('mentor', 'name email github')
+    .populate('teamLead', 'name email rollNo')
+    .lean()
+    .limit(1000);
+
+  res.json({
+    success: true,
+    data: teams,
+  });
+}));
+
+// Get single team by ID - OPTIMIZED
+router.get('/:teamId', asyncHandler(async (req, res) => {
+  const { teamId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(teamId)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid team ID'
+    });
+  }
+
+  const team = await Team.findById(teamId)
+    .populate('students', 'name email rollNo github')
+    .populate('mentor', 'name email github')
+    .populate('teamLead', 'name email rollNo')
+    .lean();
+
+  if (!team) {
+    return res.status(404).json({
+      success: false,
+      message: 'Team not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    data: team,
+  });
+}));
+
+// Update team - OPTIMIZED
+router.put('/:teamId', asyncHandler(async (req, res) => {
+  const { teamId } = req.params;
+  const { name, studentIds, mentorId } = req.body;
+
+  if (!mongoose.Types.ObjectId.isValid(teamId)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid team ID'
+    });
+  }
+
+  const team = await Team.findById(teamId);
+  if (!team) {
+    return res.status(404).json({
+      success: false,
+      message: 'Team not found'
+    });
+  }
+
+  // Check if name is unique (excluding current team)
+  if (name && name !== team.name) {
+    const existingTeam = await Team.findOne({ name, _id: { $ne: teamId } }).lean();
+    if (existingTeam) {
+      return res.status(409).json({
+        success: false,
+        message: 'Team name already exists'
+      });
     }
+  }
 
-    // Check if students exist and are not in a team
-    const students = await Student.find({ _id: { $in: studentIds } });
-    if (students.length !== studentIds.length) {
-      return res
-        .status(400)
-        .json({ error: 'One or more selected students do not exist' });
-    }
-
+  // Verify students if provided
+  if (studentIds) {
     if (studentIds.length > MAX_TEAM_SIZE) {
       return res.status(400).json({
-        error: `Team size cannot exceed ${MAX_TEAM_SIZE} members`,
+        success: false,
+        message: `Team size cannot exceed ${MAX_TEAM_SIZE} members`
       });
     }
 
-    const studentsInTeam = await Team.find({ students: { $in: studentIds } });
-    if (studentsInTeam.length > 0) {
-      const conflictingStudents = students.filter((s) =>
-        studentsInTeam.some((team) => team.students.includes(s._id))
-      );
-      return res.status(400).json({
-        error: 'One or more students are already in a team',
-        conflictingStudents: conflictingStudents.map((s) => ({
-          name: s.name,
-          rollNo: s.rollNo,
-        })),
-      });
-    }
-
-    // Automatically assign the first student as the team lead
-    const teamLeadId = studentIds[0];
-
-    // Check if mentor exists (if provided)
-    let mentor;
-    if (mentorId) {
-      mentor = await Mentor.findById(mentorId);
-      if (!mentor) {
-        return res
-          .status(400)
-          .json({ error: 'Selected mentor does not exist' });
-      }
-    }
-
-    // Create and save new team
-    const newTeam = new Team({
-      name,
-      students: studentIds,
-      mentor: mentorId,
-      teamLead: teamLeadId, // Assign team lead automatically
-    });
-
-    await newTeam.save();
-
-    // Populate student and mentor details
-    await newTeam.populate('students', 'name email rollNo github');
-    await newTeam.populate('mentor', 'name email github');
-    await newTeam.populate('teamLead', 'name email rollNo github'); // Populate team lead info
-
-    res.status(201).json(newTeam);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create team' });
-  }
-});
-
-// Get all teams
-router.get('/', async (req, res) => {
-  try {
-    const teams = await Team.find()
-      .populate('students', 'name email rollNo github')
-      .populate('mentor', 'name email github');
-    res.json(teams);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch teams' });
-  }
-});
-
-// Get a single team by ID
-router.get('/:teamId', async (req, res) => {
-  try {
-    const { teamId } = req.params;
-    const team = await Team.findById(teamId)
-      .populate('students', 'name email rollNo github')
-      .populate('mentor', 'name email github');
-
-    if (!team) {
-      return res.status(404).json({ error: 'Team not found' });
-    }
-
-    res.json(team);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch team' });
-  }
-});
-
-// Update team
-router.put('/:teamId', async (req, res) => {
-  try {
-    const { teamId } = req.params;
-    const { name, studentIds, mentorId } = req.body;
-
-    // Check if team name already exists (excluding the current team)
-    const existingTeam = await Team.findOne({ name, _id: { $ne: teamId } });
-    if (existingTeam) {
-      return res.status(400).json({ error: 'Team name already exists' });
-    }
-
-    const team = await Team.findById(teamId);
-    if (!team) {
-      return res.status(404).json({ error: 'Team not found' });
-    }
-
-    const students = await Student.find({ _id: { $in: studentIds } });
+    const students = await Student.find({ _id: { $in: studentIds } })
+      .select('_id')
+      .lean();
     if (students.length !== studentIds.length) {
-      return res
-        .status(400)
-        .json({ error: 'One or more selected students do not exist' });
+      return res.status(400).json({
+        success: false,
+        message: 'One or more selected students do not exist'
+      });
     }
 
-    const studentsInOtherTeams = await Team.find({
+    // Check if students are in other teams
+    const teamsWithStudents = await Team.find({
       _id: { $ne: teamId },
       students: { $in: studentIds },
-    });
+    }).lean();
 
-    if (studentsInOtherTeams.length > 0) {
-      const conflictingStudents = students.filter((s) =>
-        studentsInOtherTeams.some((team) => team.students.includes(s._id))
-      );
+    if (teamsWithStudents.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: 'One or more students are already in another team'
+      });
+    }
+  }
+
+  // Verify mentor if provided
+  if (mentorId) {
+    if (!mongoose.Types.ObjectId.isValid(mentorId)) {
       return res.status(400).json({
-        error: 'One or more students are already in another team',
-        conflictingStudents: conflictingStudents.map((s) => ({
-          name: s.name,
-          rollNo: s.rollNo,
-        })),
+        success: false,
+        message: 'Invalid mentor ID'
       });
     }
 
-    const mentor = await Mentor.findById(mentorId);
+    const mentor = await Mentor.findById(mentorId).select('_id').lean();
     if (!mentor) {
-      return res.status(400).json({ error: 'Selected mentor does not exist' });
+      return res.status(404).json({
+        success: false,
+        message: 'Mentor not found'
+      });
     }
 
-    team.name = name;
-    team.students = studentIds;
     team.mentor = mentorId;
-
-    await team.save();
-
-    await team.populate('students', 'name email rollNo github');
-    await team.populate('mentor', 'name email github');
-
-    res.json(team);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to update team' });
   }
-});
 
-// Delete team
-router.delete('/:teamId', async (req, res) => {
-  try {
-    const { teamId } = req.params;
+  if (name) team.name = name;
+  if (studentIds) team.students = studentIds;
 
-    const team = await Team.findById(teamId);
+  await team.save();
 
-    if (!team) {
-      return res.status(404).json({ error: 'Team not found' });
-    }
+  await team.populate([
+    { path: 'students', select: 'name email rollNo github' },
+    { path: 'mentor', select: 'name email github' },
+    { path: 'teamLead', select: 'name email rollNo' }
+  ]);
 
-    // Delete the team
-    await Team.findByIdAndDelete(teamId);
+  res.json({
+    success: true,
+    message: 'Team updated successfully',
+    data: team,
+  });
+}));
 
-    // Return success message
-    res.json({ message: 'Team deleted successfully.' });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to delete team.' });
+// Delete team - OPTIMIZED
+router.delete('/:teamId', asyncHandler(async (req, res) => {
+  const { teamId } = req.params;
+
+  if (!mongoose.Types.ObjectId.isValid(teamId)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Invalid team ID'
+    });
   }
-});
+
+  const team = await Team.findByIdAndDelete(teamId);
+
+  if (!team) {
+    return res.status(404).json({
+      success: false,
+      message: 'Team not found'
+    });
+  }
+
+  res.json({
+    success: true,
+    message: 'Team deleted successfully',
+  });
+}));
 
 module.exports = router;

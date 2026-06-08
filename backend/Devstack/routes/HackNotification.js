@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { authenticateToken } = require('../../middleware/auth');
-const HackNotification = require('../Models/HackNotification');
+const HackNotification = require('../models/HackNotification');
 
 // Get notifications for logged-in user
 router.get('/notification', authenticateToken, async (req, res) => {
