@@ -6,60 +6,51 @@ const Hackathon = require("../Models/HackathonAdmin");
 const { authenticateToken } = require("../../middleware/auth");
 const { uploadReceipt, getReceipt, deleteReceipt } = require("../Models/gridfs");
 const mongoose = require("mongoose");
+const { logger } = require("../../utils/logger");
+const { calculateStatus } = require("../utils/hackathonUtils");
 
-// Helper function to calculate hackathon status
-const calculateStatus = (regstart, enddate) => {
-  const now = new Date();
-  const startDate = new Date(regstart);
-  const endDate = new Date(enddate);
-
-  if (now < startDate) return "upcoming";
-  if (now > endDate) return "completed";
-  return "ongoing";
-};
-
+// 1️⃣ Get student's ongoing approved hackathon
 router.get("/student/:studentId/ongoing-approved", async (req, res) => {
   try {
     const { studentId } = req.params;
     const studentObjectId = new mongoose.Types.ObjectId(studentId);
 
-    console.log("🔍 Checking ongoing hackathon for student:", studentObjectId);
+    logger.info("Checking ongoing hackathon for student", { studentId: studentObjectId });
 
-    // 1️⃣ Find registrations where student is approved
+    // Find registrations where student is approved
     const approvedRegs = await HackRegister.find({
       "students.student": studentObjectId,
       "students.status": "approved",
     }).populate("hackathon");
 
-    console.log("✅ Approved registrations found:", approvedRegs.length);
+    logger.debug("Approved registrations found", { count: approvedRegs.length });
 
     if (!approvedRegs.length) {
       return res.status(200).json({ hackathon: null });
     }
 
-    // 2️⃣ Extract hackathons from approved registrations
+    // Extract hackathons from approved registrations
     const approvedHackathons = approvedRegs.map((r) => r.hackathon);
 
-    // 3️⃣ Find one that is ongoing
+    // Find one that is ongoing
     const ongoingHackathon = approvedHackathons.find(
       (h) => h && h.status === "ongoing"
     );
 
     if (!ongoingHackathon) {
-      console.log("⚠️ No ongoing hackathon found among approved ones.");
+      logger.debug("No ongoing hackathon found among approved ones.");
       return res.status(200).json({ hackathon: null });
     }
 
-    console.log("🎯 Found ongoing approved hackathon:", ongoingHackathon.hackathonname);
-
+    logger.info("Found ongoing approved hackathon", { hackathonName: ongoingHackathon.hackathonname });
     res.status(200).json({ hackathon: ongoingHackathon });
   } catch (error) {
-    console.error("❌ Error fetching ongoing approved hackathon:", error);
+    logger.error("Error fetching ongoing approved hackathon", { error: error.message });
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// 0️⃣ Generate UPI payment URL for QR code
+// 2️⃣ Generate UPI payment URL for QR code
 router.post("/upi/generate", async (req, res) => {
   try {
     const { amount } = req.body;
@@ -72,11 +63,12 @@ router.post("/upi/generate", async (req, res) => {
     const upiUrl = `upi://pay?pa=${upiId}&pn=${encodeURIComponent(payeeName)}&am=${amount}&tn=${encodeURIComponent(transactionNote)}&cu=INR`;
     res.json({ upiUrl });
   } catch (err) {
+    logger.error("Failed to generate UPI URL", { error: err.message });
     res.status(500).json({ error: "Failed to generate UPI URL" });
   }
 });
 
-// 1️⃣ Register students for a hackathon
+// 3️⃣ Register students for a hackathon
 router.post("/register", async (req, res) => {
   try {
     const { hackathonId, students } = req.body;
@@ -105,10 +97,10 @@ router.post("/register", async (req, res) => {
         if (existing) {
           // Cleanup uploaded files
           for (const fileId of uploadedFileIds) {
-            await deleteReceipt(fileId).catch(err => console.error("Cleanup error:", err));
+            await deleteReceipt(fileId).catch(err => logger.error("Cleanup error", { error: err.message }));
           }
           return res.status(400).json({ 
-            error: `Student ${s.studentId} is already registered for this hackathon` 
+            error: `Student is already registered for this hackathon` 
           });
         }
 
@@ -142,112 +134,17 @@ router.post("/register", async (req, res) => {
     } catch (uploadError) {
       // Cleanup uploaded files on error
       for (const fileId of uploadedFileIds) {
-        await deleteReceipt(fileId).catch(err => console.error("Cleanup error:", err));
+        await deleteReceipt(fileId).catch(err => logger.error("Cleanup error", { error: err.message }));
       }
       throw uploadError;
     }
   } catch (err) {
-    console.error("Error in registering:", err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    logger.error("Error in registering", { error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// 2️⃣ Get all hackathons for dropdown
-// router.get('/hackathons/all', async (req, res) => {
-//   try {
-//     let hackathons = await Hackathon.find({}, 'hackathonname entryfee regstart enddate status');
-
-//     // Update status before sending response
-//     hackathons = hackathons.map(h => {
-//       const status = calculateStatus(h.regstart, h.enddate);
-//       if (h.status !== status) {
-//         h.status = status;
-//         h.save();
-//       }
-//       return h;
-//     });
-
-//     res.json({
-//       success: true,
-//       hackathons: hackathons.map(h => ({
-//         _id: h._id,
-//         hackathonname: h.hackathonname,
-//         entryfee: h.entryfee,
-//         status: h.status,
-//         regstart: h.regstart,
-//         enddate: h.enddate
-//       }))
-//     });
-//   } catch (err) {
-//     console.error("Error fetching hackathons:", err);
-//     res.status(500).json({ error: "Server error" });
-//   }
-// });
-// 2️⃣ Get all hackathons for dropdown with filtering by college and year
-// OPTIMIZED: Get all hackathons with filtering by college and year
-// router.get('/hackathons/all', async (req, res) => {
-//   try {
-//     const { year, college } = req.query;
-
-//     // Build filter object
-//     let filter = {};
-//     if (year) filter.year = year;
-//     if (college) filter.college = college;
-
-//     // Fetch hackathons with lean() for better performance
-//     let hackathons = await Hackathon.find(filter).lean();
-
-//     // Calculate status for each hackathon in memory (faster than DB updates)
-//     hackathons = hackathons.map(h => ({
-//       ...h,
-//       status: calculateStatus(h.regstart, h.enddate)
-//     }));
-
-//     // Update statuses in background (non-blocking) - fire and forget
-//     setImmediate(async () => {
-//       try {
-//         const bulkOps = [];
-//         hackathons.forEach(h => {
-//           const originalHackathon = hackathons.find(oh => oh._id.toString() === h._id.toString());
-//           if (originalHackathon && originalHackathon.status !== h.status) {
-//             bulkOps.push({
-//               updateOne: {
-//                 filter: { _id: h._id },
-//                 update: { status: h.status }
-//               }
-//             });
-//           }
-//         });
-        
-//         if (bulkOps.length > 0) {
-//           await Hackathon.bulkWrite(bulkOps);
-//         }
-//       } catch (err) {
-//         console.error("Background status update error:", err);
-//       }
-//     });
-
-//     // Return immediately with calculated statuses
-//     res.json({
-//       success: true,
-//       hackathons: hackathons,
-//       count: hackathons.length,
-//       filters: {
-//         year: year || 'all',
-//         college: college || 'all'
-//       }
-//     });
-//   } catch (err) {
-//     console.error("Error fetching hackathons:", err);
-//     res.status(500).json({ 
-//       success: false,
-//       error: "Server error",
-//       details: err.message 
-//     });
-//   }
-// });
-
-// In your routes file, modify the hackathons/all endpoint
+// 4️⃣ Get all hackathons for dropdown with filtering by college and year
 router.get('/hackathons/all', async (req, res) => {
   try {
     const { year, college } = req.query;
@@ -283,188 +180,15 @@ router.get('/hackathons/all', async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Error fetching hackathons:", err);
+    logger.error("Error fetching hackathons", { error: err.message });
     res.status(500).json({ 
       success: false,
-      error: "Server error",
-      details: err.message 
+      error: "Server error"
     });
   }
 });
 
-// 3️⃣ Get all registered students for a specific hackathon with fee verification details
-// router.get("/hackathon/:hackathonId/students", async (req, res) => {
-//   try {
-//     const { hackathonId } = req.params;
-//     const { status } = req.query;
-
-//     if (!hackathonId.match(/^[0-9a-fA-F]{24}$/)) {
-//       console.error("Invalid hackathonId format:", hackathonId);
-//       return res.status(400).json({ error: "Invalid hackathonId format" });
-//     }
-
-//     const hackathon = await Hackathon.findById(hackathonId);
-//     if (!hackathon) {
-//       console.error("Hackathon not found for id:", hackathonId);
-//       return res.status(404).json({ error: "Hackathon not found" });
-//     }
-
-//     let query = { hackathon: hackathonId };
-//     if (status && ["pending", "approved", "rejected"].includes(status)) {
-//       query["students.status"] = status;
-//     }
-
-//     const registrations = await HackRegister.find(query)
-//       .populate({
-//         path: "students.student",
-//         select: "name email rollNo department year phone branch"
-//       })
-//       .populate("hackathon", "hackathonname entryfee");
-
-//     const studentsData = [];
-//     registrations.forEach(registration => {
-//       registration.students.forEach(studentReg => {
-//         if (status && studentReg.status !== status) {
-//           return;
-//         }
-
-//         studentsData.push({
-//           registrationId: registration._id,
-//           studentRegId: studentReg._id,
-//           student: studentReg.student,
-//           hackathon: registration.hackathon,
-//           transactionId: studentReg.transactionId,
-//           upiUtrNumber: studentReg.upiUtrNumber,
-//           status: studentReg.status,
-//           registeredAt: studentReg.registeredAt,
-//           verifiedAt: studentReg.verifiedAt,
-//           verifiedBy: studentReg.verifiedBy ? { _id: studentReg.verifiedBy, name: 'Coordinator' } : null,
-//           remarks: studentReg.remarks,
-//           feeReceipt: {
-//             contentType: studentReg.feeReceiptContentType,
-//             hasReceipt: !!studentReg.feeReceiptFileId
-//           }
-//         });
-//       });
-//     });
-
-//     res.json({
-//       success: true,
-//       hackathon: {
-//         _id: hackathon._id,
-//         hackathonname: hackathon.hackathonname,
-//         entryfee: hackathon.entryfee
-//       },
-//       students: studentsData,
-//       totalCount: studentsData.length,
-//       statusCount: {
-//         pending: studentsData.filter(s => s.status === "pending").length,
-//         approved: studentsData.filter(s => s.status === "approved").length,
-//         rejected: studentsData.filter(s => s.status === "rejected").length
-//       }
-//     });
-//   } catch (err) {
-//     console.error("Error fetching hackathon students:", err);
-//     res.status(500).json({ error: "Server error", details: err.message });
-//   }
-// });
-// router.get("/hackathon/:hackathonId/students", async (req, res) => {
-//   try {
-//     const { hackathonId } = req.params;
-//     const { status, coordinatorYear, coordinatorCollege } = req.query;
-
-//     if (!hackathonId.match(/^[0-9a-fA-F]{24}$/)) {
-//       return res.status(400).json({ error: "Invalid hackathonId format" });
-//     }
-
-//     const hackathon = await Hackathon.findById(hackathonId);
-//     if (!hackathon) {
-//       return res.status(404).json({ error: "Hackathon not found" });
-//     }
-
-//     // Verify hackathon matches coordinator's year and college
-//     if (coordinatorYear && hackathon.year !== coordinatorYear) {
-//       return res.status(403).json({ 
-//         error: "You can only view hackathons for your year" 
-//       });
-//     }
-//     if (coordinatorCollege && hackathon.college !== coordinatorCollege) {
-//       return res.status(403).json({ 
-//         error: "You can only view hackathons for your college" 
-//       });
-//     }
-
-//     let query = { hackathon: hackathonId };
-//     if (status && ["pending", "approved", "rejected"].includes(status)) {
-//       query["students.status"] = status;
-//     }
-
-//     const registrations = await HackRegister.find(query)
-//       .populate({
-//         path: "students.student",
-//         select: "name email rollNo department year phone branch college"
-//       })
-//       .populate("hackathon", "hackathonname entryfee year college");
-
-//     const studentsData = [];
-//     registrations.forEach(registration => {
-//       registration.students.forEach(studentReg => {
-//         if (status && studentReg.status !== status) {
-//           return;
-//         }
-
-//         // Filter students by coordinator's year and college
-//         const student = studentReg.student;
-//         if (coordinatorYear && student.year !== coordinatorYear) {
-//           return;
-//         }
-//         if (coordinatorCollege && student.college !== coordinatorCollege) {
-//           return;
-//         }
-
-//         studentsData.push({
-//           registrationId: registration._id,
-//           studentRegId: studentReg._id,
-//           student: studentReg.student,
-//           hackathon: registration.hackathon,
-//           transactionId: studentReg.transactionId,
-//           upiUtrNumber: studentReg.upiUtrNumber,
-//           status: studentReg.status,
-//           registeredAt: studentReg.registeredAt,
-//           verifiedAt: studentReg.verifiedAt,
-//           verifiedBy: studentReg.verifiedBy ? { _id: studentReg.verifiedBy, name: 'Coordinator' } : null,
-//           remarks: studentReg.remarks,
-//           feeReceipt: {
-//             contentType: studentReg.feeReceiptContentType,
-//             hasReceipt: !!studentReg.feeReceiptFileId
-//           }
-//         });
-//       });
-//     });
-
-//     res.json({
-//       success: true,
-//       hackathon: {
-//         _id: hackathon._id,
-//         hackathonname: hackathon.hackathonname,
-//         entryfee: hackathon.entryfee,
-//         year: hackathon.year,
-//         college: hackathon.college
-//       },
-//       students: studentsData,
-//       totalCount: studentsData.length,
-//       statusCount: {
-//         pending: studentsData.filter(s => s.status === "pending").length,
-//         approved: studentsData.filter(s => s.status === "approved").length,
-//         rejected: studentsData.filter(s => s.status === "rejected").length
-//       }
-//     });
-//   } catch (err) {
-//     console.error("Error fetching hackathon students:", err);
-//     res.status(500).json({ error: "Server error", details: err.message });
-//   }
-// });
-// 3️⃣ Get all registered students for a specific hackathon with fee verification details
+// 5️⃣ Get all registered students for a specific hackathon with fee verification details
 router.get("/hackathon/:hackathonId/students", async (req, res) => {
   try {
     const { hackathonId } = req.params;
@@ -499,7 +223,6 @@ router.get("/hackathon/:hackathonId/students", async (req, res) => {
     const registrations = await HackRegister.find(query)
       .populate({
         path: "students.student",
-        // FIXED: Changed 'year' to 'currentYear' to match schema
         select: "name email rollNo department currentYear phone branch college"
       })
       .populate("hackathon", "hackathonname entryfee year college");
@@ -513,14 +236,12 @@ router.get("/hackathon/:hackathonId/students", async (req, res) => {
 
         // Filter students by coordinator's year and college
         const student = studentReg.student;
-        
-        // FIXED: Changed student.year to student.currentYear
+        if (!student) return;
+
         if (coordinatorYear && student.currentYear !== coordinatorYear) {
-          console.log(`Filtering out student: ${student.name} - currentYear: ${student.currentYear} vs coordinator: ${coordinatorYear}`);
           return;
         }
         if (coordinatorCollege && student.college !== coordinatorCollege) {
-          console.log(`Filtering out student: ${student.name} - college: ${student.college} vs coordinator: ${coordinatorCollege}`);
           return;
         }
 
@@ -544,8 +265,6 @@ router.get("/hackathon/:hackathonId/students", async (req, res) => {
       });
     });
 
-    console.log(`Found ${studentsData.length} students matching ${coordinatorCollege} - ${coordinatorYear}`);
-
     res.json({
       success: true,
       hackathon: {
@@ -564,11 +283,12 @@ router.get("/hackathon/:hackathonId/students", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Error fetching hackathon students:", err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    logger.error("Error fetching hackathon students", { error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
-// 4️⃣ Update student fee verification status (Approve/Reject/Pending)
+
+// 6️⃣ Update student fee verification status (Approve/Reject/Pending)
 router.put("/student/:registrationId/:studentRegId/status", async (req, res) => {
   try {
     const { registrationId, studentRegId } = req.params;
@@ -578,7 +298,6 @@ router.put("/student/:registrationId/:studentRegId/status", async (req, res) => 
       return res.status(400).json({ error: "Invalid status. Must be 'approved', 'rejected', or 'pending'" });
     }
 
-    // Use $set with positional operator to update only the matched student
     const updateFields = {
       "students.$.status": status,
       "students.$.verifiedAt": new Date(),
@@ -618,12 +337,12 @@ router.put("/student/:registrationId/:studentRegId/status", async (req, res) => 
       }
     });
   } catch (err) {
-    console.error("Error updating student status:", err);
+    logger.error("Error updating student status", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// 5️⃣ Get fee receipt for a student
+// 7️⃣ Get fee receipt for a student
 router.get("/receipt/:registrationId/:studentRegId", async (req, res) => {
   try {
     const { registrationId, studentRegId } = req.params;
@@ -646,24 +365,22 @@ router.get("/receipt/:registrationId/:studentRegId", async (req, res) => {
     const downloadStream = await getReceipt(student.feeReceiptFileId);
     downloadStream.pipe(res);
   } catch (err) {
-    console.error("Error fetching receipt:", err);
+    logger.error("Error fetching receipt", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// 6️⃣ Get statistics for a hackathon
+// 8️⃣ Get statistics for a hackathon
 router.get("/hackathon/:hackathonId/stats", async (req, res) => {
   try {
     const { hackathonId } = req.params;
 
     if (!hackathonId.match(/^[0-9a-fA-F]{24}$/)) {
-      console.error("Invalid hackathonId format:", hackathonId);
       return res.status(400).json({ error: "Invalid hackathonId format" });
     }
 
     const hackathon = await Hackathon.findById(hackathonId);
     if (!hackathon) {
-      console.error("Hackathon not found for id:", hackathonId);
       return res.status(404).json({ error: "Hackathon not found" });
     }
 
@@ -696,12 +413,12 @@ router.get("/hackathon/:hackathonId/stats", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Error fetching stats:", err);
-    res.status(500).json({ error: "Server error", details: err.message });
+    logger.error("Error fetching stats", { error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
-// 7️⃣ Bulk update student statuses
+// 9️⃣ Bulk update student statuses (OPTIMIZED with bulkWrite to prevent N+1 queries)
 router.put("/hackathon/:hackathonId/bulk-update", async (req, res) => {
   try {
     const { hackathonId } = req.params;
@@ -711,61 +428,60 @@ router.put("/hackathon/:hackathonId/bulk-update", async (req, res) => {
       return res.status(400).json({ error: "No updates provided" });
     }
 
-    const results = [];
-    const errors = [];
+    const bulkOps = [];
+    const invalidUpdates = [];
 
     for (const update of updates) {
-      try {
-        const { registrationId, studentRegId, status, remarks } = update;
+      const { registrationId, studentRegId, status, remarks } = update;
 
-        if (!["approved", "rejected", "pending"].includes(status)) {
-          errors.push({ update, error: "Invalid status" });
-          continue;
-        }
-
-        const registration = await HackRegister.findById(registrationId);
-        if (!registration) {
-          errors.push({ update, error: "Registration not found" });
-          continue;
-        }
-
-        const studentIndex = registration.students.findIndex(
-          s => s._id.toString() === studentRegId
-        );
-
-        if (studentIndex === -1) {
-          errors.push({ update, error: "Student registration not found" });
-          continue;
-        }
-
-        registration.students[studentIndex].status = status;
-        registration.students[studentIndex].verifiedBy = coordinatorId;
-        registration.students[studentIndex].verifiedAt = new Date();
-        registration.students[studentIndex].remarks = remarks || "";
-
-        await registration.save();
-        results.push({ update, success: true });
-
-      } catch (err) {
-        errors.push({ update, error: err.message });
+      if (!registrationId || !studentRegId) {
+        invalidUpdates.push({ update, error: "Missing registrationId or studentRegId" });
+        continue;
       }
+
+      if (!["approved", "rejected", "pending"].includes(status)) {
+        invalidUpdates.push({ update, error: "Invalid status" });
+        continue;
+      }
+
+      bulkOps.push({
+        updateOne: {
+          filter: { 
+            _id: registrationId, 
+            "students._id": studentRegId 
+          },
+          update: {
+            $set: {
+              "students.$.status": status,
+              "students.$.verifiedBy": coordinatorId,
+              "students.$.verifiedAt": new Date(),
+              "students.$.remarks": remarks || ""
+            }
+          }
+        }
+      });
+    }
+
+    let bulkResult = null;
+    if (bulkOps.length > 0) {
+      bulkResult = await HackRegister.bulkWrite(bulkOps);
     }
 
     res.json({
       success: true,
-      processed: results.length,
-      errors: errors.length,
-      results,
-      errors
+      processed: bulkResult ? bulkResult.modifiedCount : 0,
+      errors: invalidUpdates.length,
+      results: updates.filter(up => !invalidUpdates.some(iu => iu.update === up)).map(up => ({ update: up, success: true })),
+      invalidUpdates
     });
 
   } catch (err) {
-    console.error("Error in bulk update:", err);
+    logger.error("Error in bulk update", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// 8️⃣ Delete student registration (optional - useful for cleanup)
+// 🔟 Delete student registration
 router.delete("/student/:registrationId/:studentRegId", async (req, res) => {
   try {
     const { registrationId, studentRegId } = req.params;
@@ -804,12 +520,12 @@ router.delete("/student/:registrationId/:studentRegId", async (req, res) => {
       message: "Student registration deleted successfully"
     });
   } catch (err) {
-    console.error("Error deleting registration:", err);
+    logger.error("Error deleting registration", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
 
-// Legacy routes (keeping for backward compatibility)
+// ─── Legacy/Compatibility routes ──────────────────────────────────────────────
 router.put("/:id/status", async (req, res) => {
   try {
     const { status, coordinatorId } = req.body;
@@ -828,6 +544,7 @@ router.put("/:id/status", async (req, res) => {
 
     res.json(updated);
   } catch (err) {
+    logger.error("Error in legacy status update", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -841,6 +558,7 @@ router.get("/hackathon/:hackathonId/approved", async (req, res) => {
 
     res.json(approved);
   } catch (err) {
+    logger.error("Error in fetching legacy approved registrations", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -867,7 +585,7 @@ router.get("/hackathon/:hackathonId/student/:studentId/status", async (req, res)
       registeredAt: studentData.registeredAt,
     });
   } catch (err) {
-    console.error("Error fetching fee status:", err);
+    logger.error("Error fetching fee status", { error: err.message });
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -876,12 +594,14 @@ router.get('/approved/:hackathonId', authenticateToken, async (req, res) => {
   try {
     const { hackathonId } = req.params;
     const userId = req.user.userId || req.user.id || req.user._id;
-    const reg = await require('../Models/hack-reg').findOne({ hackathon: hackathonId });
+    const reg = await HackRegister.findOne({ hackathon: hackathonId });
     if (!reg) return res.json([]);
     const approved = reg.students.filter(s => s.student.toString() === userId && s.status === 'approved');
     res.json(approved);
   } catch (err) {
+    logger.error("Failed to fetch approved registration", { error: err.message });
     res.status(500).json({ error: 'Failed to fetch approved registration' });
   }
 });
+
 module.exports = router;

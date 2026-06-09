@@ -1,23 +1,19 @@
 const express = require('express');
 const router = express.Router();
-const Hackathon = require('../models/HackathonAdmin');
+const Hackathon = require('../Models/HackathonAdmin');
 const upload = require("../middleware/upload");
 const { authenticateToken } = require("../../middleware/auth");
+const { logger } = require('../../utils/logger');
+const { calculateStatus } = require('../utils/hackathonUtils');
 
 // Admin check middleware
 const isAdmin = (req, res, next) => {
-  if (req.user.role !== 'admin') {
+  const role = req.user.role || req.user.userRole || req.user.type;
+  if (role !== 'admin') {
+    logger.warn("Access denied. Admins only.", { userId: req.user.userId, role });
     return res.status(403).json({ message: "Access denied. Admins only." });
   }
   next();
-};
-
-// 🔹 Utility function to calculate status
-const calculateStatus = (regstart, enddate) => {
-  const now = new Date();
-  if (now < regstart) return "upcoming";
-  if (now >= regstart && now <= enddate) return "ongoing";
-  return "completed";
 };
 
 // Create hackathon 
@@ -46,8 +42,8 @@ router.post(
       // Create single hackathon for all colleges or specific college
       const hackathonData = {
         ...data,
-        hackathonname: data.hackathonname, // Keep hackathon name as is without college suffix
-        college: data.college, // Use "All" or specific college name
+        hackathonname: data.hackathonname, 
+        college: data.college, 
         startdate: new Date(data.startdate),
         enddate,
         regstart,
@@ -69,53 +65,71 @@ router.post(
       await newHackathon.save();
 
       const collegeText = data.college === 'All' ? 'all colleges' : `${data.college} college`;
+      logger.info("Hackathon created successfully", { hackathonId: newHackathon._id, college: data.college });
+      
       res.status(201).json({
         message: `Hackathon created successfully for ${collegeText}`,
         hackathon: newHackathon,
       });
     } catch (error) {
-      res.status(500).json({ message: error.message });
+      logger.error("Hackathon creation error", { error: error.message });
+      res.status(500).json({ message: "Internal server error" });
     }
   }
 );
 
-// Get all hackathons (Public)
+// Get all hackathons (Public) - Paginated, excludes large binary data
 router.get('/all', async (req, res) => {
   try {
-    // Pagination support
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
     const skip = (page - 1) * limit;
 
-    let hackathons = await Hackathon.find().skip(skip).limit(limit);
+    let hackathons = await Hackathon.find()
+      .select('-hackathonposter -qrcode')
+      .skip(skip)
+      .limit(limit)
+      .lean();
 
-    // Only update status in-memory, do not write to DB on every GET
+    // Only update status in-memory
     hackathons = hackathons.map(h => {
-      const status = calculateStatus(h.regstart, h.enddate);
-      h.status = status;
+      h.status = calculateStatus(h.regstart, h.enddate);
       return h;
     });
 
-    // Optionally, update status in DB asynchronously (background job recommended)
-    // Do NOT use h.save() here, it blocks the event loop
-
     res.json(hackathons);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    logger.error("Error fetching all hackathons", { error: error.message });
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
-// GET /hackathon - Return all hackathons
+// GET /hackathon - Return all hackathons - Paginated, excludes large binary data
 router.get('/', async (req, res) => {
   try {
-  const hackathons = await require('../models/HackathonAdmin').find();
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    let hackathons = await Hackathon.find()
+      .select('-hackathonposter -qrcode')
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    hackathons = hackathons.map(h => {
+      h.status = calculateStatus(h.regstart, h.enddate);
+      return h;
+    });
+
     res.json(hackathons);
   } catch (err) {
+    logger.error("Failed to fetch hackathons", { error: err.message });
     res.status(500).json({ error: 'Failed to fetch hackathons' });
   }
 });
 
-// Get hackathon by ID 
+// Get hackathon by ID - Returns single hackathon (with poster and qrcode)
 router.get('/:id', async (req, res) => {
   try {
     const hackathon = await Hackathon.findById(req.params.id);
@@ -123,16 +137,14 @@ router.get('/:id', async (req, res) => {
       return res.status(404).json({ message: "Hackathon not found" });
     }
 
-    // 🔹 Update status if outdated
+    // Dynamic status calculation in-memory (no write-on-read database update)
     const status = calculateStatus(hackathon.regstart, hackathon.enddate);
-    if (hackathon.status !== status) {
-      hackathon.status = status;
-      await hackathon.save();
-    }
+    hackathon.status = status;
 
     res.json(hackathon);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    logger.error("Failed to fetch hackathon by ID", { error: error.message });
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
@@ -177,7 +189,7 @@ router.put(
         };
       }
 
-      // 🔹 Recalculate status
+      // Recalculate status in-memory
       data.status = calculateStatus(data.regstart, data.enddate);
 
       const updatedHackathon = await Hackathon.findByIdAndUpdate(
@@ -186,12 +198,15 @@ router.put(
         { new: true, runValidators: true }
       );
 
+      logger.info("Hackathon updated successfully", { hackathonId: req.params.id });
+
       res.json({
         message: "Hackathon updated successfully",
         hackathon: updatedHackathon,
       });
     } catch (error) {
-      res.status(500).json({ message: error.message });
+      logger.error("Hackathon update error", { error: error.message });
+      res.status(500).json({ message: "Internal server error" });
     }
   }
 );
@@ -205,9 +220,11 @@ router.delete('/:id', authenticateToken, isAdmin, async (req, res) => {
     }
 
     await Hackathon.findByIdAndDelete(req.params.id);
+    logger.info("Hackathon deleted successfully", { hackathonId: req.params.id });
     res.json({ message: "Hackathon deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    logger.error("Hackathon deletion error", { error: error.message });
+    res.status(500).json({ message: "Internal server error" });
   }
 });
 
@@ -222,6 +239,7 @@ router.get("/poster/:id", async (req, res) => {
     res.set("Content-Type", hackathon.hackathonposter.contentType);
     res.send(hackathon.hackathonposter.data);
   } catch (err) {
+    logger.error("Error fetching poster", { error: err.message });
     res.status(500).send("Error fetching poster");
   }
 });
@@ -237,6 +255,7 @@ router.get("/qrcode/:id", async (req, res) => {
     res.set("Content-Type", hackathon.qrcode.contentType);
     res.send(hackathon.qrcode.data);
   } catch (err) {
+    logger.error("Error fetching QR code", { error: err.message });
     res.status(500).send("Error fetching QR code");
   }
 });

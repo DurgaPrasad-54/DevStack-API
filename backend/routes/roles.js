@@ -3,18 +3,33 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
+const { logger } = require('../utils/logger');
 require('dotenv').config();
-const {authenticateToken,requireRole} = require('../middleware/auth')
+const { authenticateToken, requireRole } = require('../middleware/auth');
+
+// ─── JWT helper — always uses SECRET_KEY from env ────────────────────────────
+const signToken = (payload, expiresIn = '5h') =>
+  jwt.sign(payload, process.env.SECRET_KEY, { expiresIn });
+
 
 // Import Models
 const { Student, Mentor, Admin, Coordinator } = require('../models/roles');
 
+// Single shared transporter — avoids duplicate creation
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.ADMIN_USER,
-    pass: process.env.ADMIN_PASS
-  }
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_PASS,
+  },
+  pool: true,           // Reuse connections
+  maxConnections: 5,
+});
+
+// Verify transporter on startup
+transporter.verify((error) => {
+  if (error) logger.error('Email transporter error', { error: error.message });
+  else logger.info('Email transporter ready');
 });
 
 // Signup Routes
@@ -34,8 +49,7 @@ router.post('/student/signup', async (req, res) => {
       linkedin 
     } = req.body;
     
-    // Log the incoming request body
-    console.log("Student Signup Request Body:", req.body);
+    logger.info('Student signup attempt', { email: req.body.email });
     
     // Validation for required fields
     if (!name || !email || !phoneNumber || !password || !rollNo || !branch || !year || !currentYear || !college) {
@@ -139,13 +153,7 @@ router.post('/student/signup', async (req, res) => {
     // Save student to database
     await student.save();
     
-    console.log("Student registered successfully:", {
-      id: student._id,
-      name: student.name,
-      email: student.email,
-      currentYear: student.currentYear,
-      branch: student.branch
-    });
+    logger.info('Student registered', { id: student._id, email: student.email });
     
     res.status(201).json({ 
       message: 'Student registered successfully',
@@ -153,7 +161,7 @@ router.post('/student/signup', async (req, res) => {
     });
     
   } catch (error) {
-    console.error("Student Signup Error:", error);
+    logger.error("Student Signup Error", { error: error.message });
     
     // Handle MongoDB duplicate key errors
     if (error.code === 11000) {
@@ -197,8 +205,7 @@ router.post('/mentor/signup', async (req, res) => {
   try {
     const {name, email, phoneNumber, password, github, linkedin} = req.body;
 
-    // Log the incoming request body
-    console.log("Mentor Signup Request Body:", req.body);
+    logger.info('Mentor signup attempt', { email: req.body.email });
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
@@ -222,36 +229,40 @@ router.post('/mentor/signup', async (req, res) => {
       mentor: mentor._id
     });
   } catch(error) {
-    console.error("Mentor Signup Error:", error);
-    res.status(500).json({error: error.message});
+    logger.error("Mentor Signup Error", { error: error.message });
+    res.status(500).json({error: 'Internal server error'});
   }
 });
 
-// Admin Signup Route
-router.post('/admin/signup', async (req,res) => {
- try {
-   const {name,email,phoneNumber,password} = req.body;
-
-   const hashedPassword=await bcrypt.hash(password ,10);
-
-   const admin=new Admin({
-     name,
-     email,
-     phoneNumber,
-     password : hashedPassword
-   });
-
-   await admin.save();
-   res.status(201).json({message:'Admin registered successfully'});
- } catch(error){
-   res.status(500).json({error:error.message});
- }
+// Admin Signup Route — SECURED: requires existing admin JWT
+router.post('/admin/signup', authenticateToken, requireRole(['admin']), async (req, res) => {
+  try {
+    const { name, email, phoneNumber, password } = req.body;
+    if (!name || !email || !phoneNumber || !password) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    const existing = await Admin.findOne({ email });
+    if (existing) {
+      return res.status(409).json({ error: 'Admin with this email already exists' });
+    }
+    if (password.length < 12) {
+      return res.status(400).json({ error: 'Admin password must be at least 12 characters' });
+    }
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const admin = new Admin({ name, email, phoneNumber, password: hashedPassword });
+    await admin.save();
+    logger.info('Admin created', { createdBy: req.user.userId, newAdminEmail: email });
+    res.status(201).json({ message: 'Admin registered successfully' });
+  } catch (error) {
+    logger.error('Admin signup error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 
 
 // Updated coordinator registration route (admin only)
-router.post('/admin/register-coordinator', async (req, res) => {
+router.post('/admin/register-coordinator', authenticateToken, requireRole(['admin']), async (req, res) => {
   try {
     const { name, email, phoneNumber, college, year, github, linkedin } = req.body;
 
@@ -315,24 +326,15 @@ router.post('/admin/register-coordinator', async (req, res) => {
       coordinatorId: coordinator._id 
     });
   } catch (error) {
-    console.error('Error registering coordinator:', error);
+    logger.error('Error registering coordinator', { error: error.message });
     res.status(500).json({ error: 'Internal server error while registering coordinator' });
   }
 });
 
 // Email sending function
-// const nodemailer = require('nodemailer');
 
-const sendCoordinatorCredentials = async (coordinator, password) => {
+const sendCoordinatorCredentials = async (coordinator, temporaryPassword) => {
   try {
-    // Configure your email transporter
-    const transporter = nodemailer.createTransport({
-      service: 'gmail', // or your email service
-      auth: {
-        user: process.env.ADMIN_USER,
-        pass: process.env.ADMIN_PASS
-      }
-    });
 
     const emailTemplate = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f9f9f9;">
@@ -382,7 +384,8 @@ const sendCoordinatorCredentials = async (coordinator, password) => {
           <div style="background-color: #e3f2fd; padding: 20px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #2196f3;">
             <h3 style="color: #1976d2; margin-bottom: 15px;">Login Credentials:</h3>
             <p style="color: #333; margin: 5px 0;"><strong>Username:</strong> ${coordinator.email}</p>
-            <p style="color: #333; margin: 5px 0;"><strong>Password:</strong> ${password}</p>
+            <p style="color: #333; margin: 5px 0;"><strong>Temporary Password:</strong> ${temporaryPassword}</p>
+            <p style="color: #856404; font-size: 13px; margin-top: 8px;">⚠️ Please change your password immediately after first login.</p>
           </div>
           
           <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0; border-left: 4px solid #ffc107;">
@@ -407,16 +410,16 @@ const sendCoordinatorCredentials = async (coordinator, password) => {
     `;
 
     const mailOptions = {
-      from: process.env.EMAIL_USER,
+      from: process.env.GMAIL_USER,
       to: coordinator.email,
       subject: 'Welcome! Your Coordinator Account Credentials',
-      html: emailTemplate
+      html: emailTemplate,
     };
 
     await transporter.sendMail(mailOptions);
-    console.log('Credentials email sent successfully to:', coordinator.email);
+    logger.info('Coordinator credentials email sent', { email: coordinator.email });
   } catch (error) {
-    console.error('Error sending email:', error);
+    logger.error('Failed to send coordinator credentials email', { error: error.message });
     throw error;
   }
 };
@@ -438,10 +441,13 @@ router.post('/student/login', async (req,res) => {
      return res.status(401).json({message:'Invalid email or password'});
    }
 
-   const token=jwt.sign({userId : student._id , role : 'student'}, 'your-secret-key',{expiresIn:'5h'});
-   res.json({token,student:student});
- } catch(error){
-   res.status(500).json({error:error.message});
+   const token = signToken({ userId: student._id, role: 'student' });
+   // Never return the full student object — exclude sensitive fields
+   const { password: _pw, otp: _otp, otpExpiry: _exp, ...safeStudent } = student.toObject();
+   res.json({ token, role: 'student', student: safeStudent });
+ } catch (error) {
+   logger.error('Student login error', { error: error.message });
+   res.status(500).json({ error: 'Internal server error' });
  }
 });
 
@@ -469,18 +475,11 @@ router.post('/mentor/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    // Create the JWT token
-    const token = jwt.sign(
-      { userId: mentor._id, role: 'mentor' },
-      'your-secret-key',
-      { expiresIn: '5h' }
-    );
-
-    // Send the token in response
-    res.json({ token,role: 'mentor', mentor: mentor._id });
+    const token = signToken({ userId: mentor._id, role: 'mentor' });
+    res.json({ token, role: 'mentor', mentor: mentor._id });
   } catch (error) {
-    console.error("Mentor Login Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error('Mentor login error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -496,14 +495,12 @@ router.post('/coordinator/login', async (req, res) => {
     if (!isValidPassword) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
-    const token = jwt.sign(
-      { userId: coordinator._id, role: 'coordinator' },
-      'your-secret-key',
-      { expiresIn: '5h' }
-    );
-    res.json({ token, role: 'coordinator',coordinatordetails:coordinator });
+    const token = signToken({ userId: coordinator._id, role: 'coordinator' });
+    const { password: _pw, otp: _otp, otpExpiry: _exp, ...safeCoord } = coordinator.toObject();
+    res.json({ token, role: 'coordinator', coordinatordetails: safeCoord });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error('Coordinator login error', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -529,7 +526,7 @@ router.post('/admin/login', async (req, res) => {
 
     // Send OTP via email
     await transporter.sendMail({
-      from: process.env.EMAIL,
+      from: process.env.GMAIL_USER,
       to: email,
       subject: 'Login OTP',
       text: `Your OTP for login is: ${otp}`
@@ -537,8 +534,8 @@ router.post('/admin/login', async (req, res) => {
     
     res.json({ message: 'OTP sent successfully', role: 'admin', requireOTP: true });
   } catch (error) {
-    console.error("Admin Login Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Admin Login Error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -557,47 +554,37 @@ router.post('/admin/verify-otp', async (req, res) => {
       return res.status(401).json({ message: 'Invalid or expired OTP' });
     }
 
-    // Create JWT token
-    const token = jwt.sign(
-      { userId: admin._id, role: 'admin' },
-      'your-secret-key',
-      { expiresIn: '5h' }
-    );
-    
+    const token = signToken({ userId: admin._id, role: 'admin' });
     // Clear OTP fields after successful verification
     admin.otp = null;
     admin.otpExpiry = null;
     await admin.save();
-
+    logger.info('Admin OTP verified, login successful', { adminId: admin._id });
     res.json({ token, admin: admin._id.toString() });
   } catch (error) {
-    console.error("OTP Verification Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("OTP Verification Error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Change password with old password
 router.post('/admin/reset-password', async (req, res) => {
   try {
-    console.log("Request Body:", req.body);
     const { email, oldPassword, newPassword } = req.body;
 
     if (!email || !oldPassword || !newPassword) {
-      console.log("Missing input fields");
       return res.status(400).json({ message: "Missing input fields" });
     }
 
     // Find the user by email
     const admin = await Admin.findOne({ email }); 
     if (!admin) {
-      console.log("Admin not found");
       return res.status(404).json({ message: "Admin not found" });
     }
 
     // Check if old password is correct
     const isValidPassword = await bcrypt.compare(oldPassword, admin.password);
     if (!isValidPassword) {
-      console.log("Invalid old password");
       return res.status(401).json({ message: "Invalid old password" });
     }
 
@@ -606,80 +593,66 @@ router.post('/admin/reset-password', async (req, res) => {
     admin.password = hashedPassword;
     await admin.save();
 
-    console.log("Password updated successfully");
+    logger.info("Admin password updated successfully", { email });
     res.json({ message: "Password updated successfully" });
   } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Admin password reset error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Reset password with OTP
-// Reset password with OTP - Fixed version
 router.post('/admin/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     
-    // Add some logging to trace execution
-    console.log(`Processing forgot password for admin email: ${email}`);
+    logger.info(`Processing forgot password for admin`, { email });
     
     const admin = await Admin.findOne({ email });
     
     if (!admin) {
-      console.log(`Admin not found with email: ${email}`);
+      logger.warn(`Admin not found with email: ${email}`);
       return res.status(404).json({ message: "Email not found!" });
     }
-
-    console.log(`Found admin: ${admin._id}`);
 
     // Generate OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const otpExpiry = new Date(Date.now() + 600000); // 10 minutes from now
     
-    console.log(`Generated OTP: ${otp} with expiry: ${otpExpiry}`);
-    
-    // Store OTP in database - explicitly set the fields
+    logger.info(`OTP generated for admin`, { adminId: admin._id, expiresAt: otpExpiry });
+
+    // Store OTP in database
     admin.otp = otp;
     admin.otpExpiry = otpExpiry;
     
-    // Add detailed logging for save operation
     try {
       const savedAdmin = await admin.save();
-      console.log(`Admin saved with OTP. Updated document:`, {
-        id: savedAdmin._id,
-        email: savedAdmin.email,
-        hasOtp: !!savedAdmin.otp,
-        otpValue: savedAdmin.otp,
-        otpExpiry: savedAdmin.otpExpiry
-      });
+      logger.info('Admin OTP saved', { adminId: savedAdmin._id, hasOtp: !!savedAdmin.otp });
     } catch (saveError) {
-      console.error("Error saving admin with OTP:", saveError);
+      logger.error('Error saving admin OTP', { error: saveError.message });
       return res.status(500).json({ message: "Failed to save OTP. Database error." });
     }
 
     // Send OTP via email
     try {
       await transporter.sendMail({
-        from: process.env.EMAIL,
+        from: process.env.GMAIL_USER,
         to: email,
         subject: 'Password Reset OTP',
-        text: `Your OTP for password reset is: ${otp}`
+        text: `Your OTP for password reset is: ${otp}\n\nThis OTP expires in 10 minutes.`,
       });
-      
-      console.log(`Email sent successfully to ${email}`);
-      res.json({ message: "OTP sent to your email!" });
+      logger.info('Admin forgot-password OTP sent', { adminId: admin._id });
+      res.json({ message: 'OTP sent to your email!' });
     } catch (emailError) {
-      console.error("Email sending failed:", emailError);
-      // Revert the OTP save if email fails
+      logger.error('Failed to send admin OTP email', { error: emailError.message });
       admin.otp = undefined;
       admin.otpExpiry = undefined;
       await admin.save();
-      
-      res.status(500).json({ message: "Failed to send OTP email. Please try again later." });
+      res.status(500).json({ message: 'Failed to send OTP email. Please try again later.' });
     }
   } catch (error) {
-    console.error("Forgot Password Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Forgot Password Error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -699,8 +672,8 @@ router.post('/admin/validate-otp', async (req, res) => {
 
     res.json({ message: 'OTP validated successfully!' });
   } catch (error) {
-    console.error("OTP Validation Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("OTP Validation Error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -727,11 +700,11 @@ router.post('/admin/reset-forgot-password', async (req, res) => {
     admin.otpExpiry = undefined;
     
     await admin.save();
-
+    logger.info("Admin password reset via OTP successful", { email });
     res.json({ message: "Password reset successfully!" });
   } catch (error) {
-    console.error("Password Reset Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Password Reset Error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -739,23 +712,19 @@ router.post('/admin/reset-forgot-password', async (req, res) => {
 // Student password reset routes
 router.post('/student/reset-password', async (req, res) => {
   try {
-    console.log("Request Body:", req.body);
     const { email, oldPassword, newPassword } = req.body;
 
     if (!email || !oldPassword || !newPassword) {
-      console.log("Missing input fields");
       return res.status(400).json({ message: "Missing input fields" });
     }
 
     const user = await Student.findOne({ email });
     if (!user) {
-      console.log("User not found");
       return res.status(404).json({ message: "User not found" });
     }
 
     const isValidPassword = await bcrypt.compare(oldPassword, user.password);
     if (!isValidPassword) {
-      console.log("Invalid old password");
       return res.status(401).json({ message: "Invalid old password" });
     }
 
@@ -763,11 +732,11 @@ router.post('/student/reset-password', async (req, res) => {
     user.password = hashedPassword;
     await user.save();
 
-    console.log("Password updated successfully");
+    logger.info("Student password reset successful", { email });
     res.json({ message: "Password updated successfully" });
   } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Student password reset error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -789,14 +758,16 @@ router.post('/student/forgot-password', async (req, res) => {
     await user.save();
     
     await transporter.sendMail({
-      from: process.env.EMAIL,
+      from: process.env.GMAIL_USER,
       to: email,
       subject: 'Password Reset OTP',
-      text: `Your OTP for password reset is: ${otp}`
+      text: `Your OTP for password reset is: ${otp}\n\nThis OTP expires in 10 minutes.`,
     });
-    res.json({ message: "OTP sent to your email!" });
+    logger.info('Student forgot-password OTP sent', { studentId: user._id });
+    res.json({ message: 'OTP sent to your email!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Student forgot password error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -816,7 +787,8 @@ router.post('/student/validate-otp', async (req, res) => {
 
     res.json({ message: 'OTP validated successfully!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Student OTP validation error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -842,33 +814,30 @@ router.post('/student/reset-forgot-password', async (req, res) => {
     user.otpExpiry = null;
     
     await user.save();
-
+    logger.info("Student password reset via OTP successful", { email });
     res.json({ message: "Password reset successfully!" });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Student password reset via OTP error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Mentor password reset routes
 router.post('/mentor/reset-password', async (req, res) => {
   try {
-    console.log("Request Body:", req.body);
     const { email, oldPassword, newPassword } = req.body;
 
     if (!email || !oldPassword || !newPassword) {
-      console.log("Missing input fields");
       return res.status(400).json({ message: "Missing input fields" });
     }
 
     const mentor = await Mentor.findOne({ email });
     if (!mentor) {
-      console.log("Mentor not found");
       return res.status(404).json({ message: "Mentor not found" });
     }
 
     const isValidPassword = await bcrypt.compare(oldPassword, mentor.password);
     if (!isValidPassword) {
-      console.log("Invalid old password");
       return res.status(401).json({ message: "Invalid old password" });
     }
 
@@ -876,11 +845,11 @@ router.post('/mentor/reset-password', async (req, res) => {
     mentor.password = hashedPassword;
     await mentor.save();
 
-    console.log("Password updated successfully");
+    logger.info("Mentor password updated successfully", { email });
     res.json({ message: "Password updated successfully" });
   } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: error.message });
+    logger.error("Mentor password reset error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -902,14 +871,16 @@ router.post('/mentor/forgot-password', async (req, res) => {
     await mentor.save();
     
     await transporter.sendMail({
-      from: process.env.EMAIL,
+      from: process.env.GMAIL_USER,
       to: email,
       subject: 'Password Reset OTP',
-      text: `Your OTP for password reset is: ${otp}`
+      text: `Your OTP for password reset is: ${otp}\n\nThis OTP expires in 10 minutes.`,
     });
-    res.json({ message: "OTP sent to your email!" });
+    logger.info('Mentor forgot-password OTP sent', { mentorId: mentor._id });
+    res.json({ message: 'OTP sent to your email!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Mentor forgot password error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -929,7 +900,8 @@ router.post('/mentor/validate-otp', async (req, res) => {
 
     res.json({ message: 'OTP validated successfully!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Mentor OTP validation error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -955,10 +927,11 @@ router.post('/mentor/reset-forgot-password', async (req, res) => {
     mentor.otpExpiry = null;
     
     await mentor.save();
-
+    logger.info("Mentor password reset via OTP successful", { email });
     res.json({ message: "Password reset successfully!" });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Mentor password reset via OTP error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -970,7 +943,8 @@ router.get('/coordinator', async (req, res) => {
     const coordinators = await Coordinator.find();
     res.json(coordinators);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Error getting coordinators", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -981,7 +955,8 @@ router.get('/coordinator/:id', async (req, res) => {
     if (!coordinator) return res.status(404).json({ error: 'Coordinator not found' });
     res.json(coordinator);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Error getting coordinator by ID", { error: error.message, id: req.params.id });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1005,7 +980,8 @@ router.put('/coordinator/:id', async (req, res) => {
     if (!coordinator) return res.status(404).json({ error: 'Coordinator not found' });
     res.json({ message: 'Coordinator updated successfully', coordinator });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Error updating coordinator", { error: error.message, id: req.params.id });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1016,7 +992,8 @@ router.delete('/coordinator/:id', async (req, res) => {
     if (!coordinator) return res.status(404).json({ error: 'Coordinator not found' });
     res.json({ message: 'Coordinator deleted successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Error deleting coordinator", { error: error.message, id: req.params.id });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1038,9 +1015,11 @@ router.post('/coordinator/reset-password', async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     coordinator.password = hashedPassword;
     await coordinator.save();
+    logger.info("Coordinator password updated successfully", { email });
     res.json({ message: 'Password updated successfully' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Coordinator password reset error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1057,14 +1036,16 @@ router.post('/coordinator/forgot-password', async (req, res) => {
     coordinator.otpExpiry = otpExpiry;
     await coordinator.save();
     await transporter.sendMail({
-      from: process.env.EMAIL,
+      from: process.env.GMAIL_USER,
       to: email,
       subject: 'Password Reset OTP',
-      text: `Your OTP for password reset is: ${otp}`
+      text: `Your OTP for password reset is: ${otp}\n\nThis OTP expires in 10 minutes.`,
     });
+    logger.info('Coordinator forgot-password OTP sent', { coordinatorId: coordinator._id });
     res.json({ message: 'OTP sent to your email!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Coordinator forgot password error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1080,7 +1061,8 @@ router.post('/coordinator/validate-otp', async (req, res) => {
     }
     res.json({ message: 'OTP validated successfully!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Coordinator validate-otp error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -1099,20 +1081,12 @@ router.post('/coordinator/reset-forgot-password', async (req, res) => {
     coordinator.otp = null;
     coordinator.otpExpiry = null;
     await coordinator.save();
+    logger.info("Coordinator password reset via OTP successful", { email });
     res.json({ message: 'Password reset successfully!' });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    logger.error("Password reset verification error", { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-// Role-based authorization middleware
-// function requireRole(roles) {
-//   return (req, res, next) => {
-//     if (!req.user || !roles.includes(req.user.role)) {
-//       return res.status(403).json({ message: 'Forbidden: insufficient privileges' });
-//     }
-//     next();
-//   };
-// }
 
 module.exports = router;

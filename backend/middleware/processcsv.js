@@ -71,7 +71,7 @@ const generateEmailTemplate = (studentName, email, password) => {
 async function sendWelcomeEmail(studentName, email, password) {
   try {
     const mailOptions = {
-      from: process.env.EMAIL_USER,
+      from: process.env.ADMIN_USER,
       to: email,
       subject: '🎓 Welcome to Student Portal - Your Account Details',
       html: generateEmailTemplate(studentName, email, password)

@@ -1,57 +1,59 @@
 const cron = require('node-cron');
 const Hackathon = require('../Models/HackathonAdmin');
+const { calculateStatus } = require("../utils/hackathonUtils");
+const { logger } = require('../../utils/logger');
 
-// Utility function to calculate status
-const calculateStatus = (regstart, enddate) => {
-  const now = new Date();
-  if (now < regstart) return "upcoming";
-  if (now >= regstart && now <= enddate) return "ongoing";
-  return "completed";
-};
-
-// Function to update hackathon statuses
+// Function to update hackathon statuses using bulkWrite
 const updateHackathonStatuses = async () => {
   try {
-    console.log('[Hackathon Scheduler] Starting status update...');
+    logger.info('[Hackathon Scheduler] Starting status update...');
     
     // Find all hackathons that are not completed
     const hackathons = await Hackathon.find({
       status: { $in: ['upcoming', 'ongoing'] }
-    });
+    }).lean();
 
-    let updatedCount = 0;
+    const bulkOps = [];
 
     for (const hackathon of hackathons) {
       const newStatus = calculateStatus(hackathon.regstart, hackathon.enddate);
       
       if (hackathon.status !== newStatus) {
-        hackathon.status = newStatus;
-        await hackathon.save();
-        updatedCount++;
-        console.log(`[Hackathon Scheduler] Updated "${hackathon.hackathonname}" status to "${newStatus}"`);
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: hackathon._id },
+            update: { $set: { status: newStatus } }
+          }
+        });
+        logger.info(`[Hackathon Scheduler] Preparing status update for "${hackathon.hackathonname}" to "${newStatus}"`);
       }
     }
 
-    console.log(`[Hackathon Scheduler] Completed. Updated ${updatedCount} hackathon(s).`);
+    let updatedCount = 0;
+    if (bulkOps.length > 0) {
+      const result = await Hackathon.bulkWrite(bulkOps);
+      updatedCount = result.modifiedCount;
+    }
+
+    logger.info(`[Hackathon Scheduler] Completed. Updated ${updatedCount} hackathon(s).`);
   } catch (error) {
-    console.error('[Hackathon Scheduler] Error updating statuses:', error);
+    logger.error('[Hackathon Scheduler] Error updating statuses', { error: error.message });
   }
 };
 
 // Schedule to run every hour at minute 0
-// Cron format: minute hour day-of-month month day-of-week
 const startHackathonStatusScheduler = () => {
   // Run every hour
   cron.schedule('0 * * * *', () => {
-    console.log('[Hackathon Scheduler] Running scheduled status update...');
+    logger.info('[Hackathon Scheduler] Running scheduled status update...');
     updateHackathonStatuses();
   });
 
   // Also run immediately on startup
-  console.log('[Hackathon Scheduler] Running initial status update...');
+  logger.info('[Hackathon Scheduler] Running initial status update...');
   updateHackathonStatuses();
 
-  console.log('[Hackathon Scheduler] Scheduler started - runs every hour');
+  logger.info('[Hackathon Scheduler] Scheduler started - runs every hour');
 };
 
 module.exports = {

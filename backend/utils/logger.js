@@ -62,9 +62,14 @@ class AppLogger {
     }
     
     // File logging for all environments
-    fs.appendFileSync(
+    fs.appendFile(
       path.join(logsDir, `${level.toLowerCase()}.log`),
-      logString + '\n'
+      logString + '\n',
+      (err) => {
+        if (err) {
+          console.error('Failed to write to log file:', err);
+        }
+      }
     );
   }
 

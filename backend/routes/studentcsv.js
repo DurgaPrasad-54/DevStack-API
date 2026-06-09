@@ -4,6 +4,7 @@ const csv = require('csv-parser');
 const xlsx = require('xlsx');
 const { Readable } = require('stream');
 const processStudents = require('../middleware/processcsv'); // Import the processStudents middleware
+const { logger } = require('../utils/logger');
 
 const router = express.Router();
 
@@ -52,7 +53,7 @@ router.post('/register-students', upload.single('file'), async (req, res) => {
       existingStudents: results.existingStudents
     });
   } catch (error) {
-    console.error('Error processing file:', error);
+    logger.error('Error processing file', { error: error.message });
     res.status(500).json({ error: 'Error processing file' });
   }
   // No need to clean up file as it's stored in memory
