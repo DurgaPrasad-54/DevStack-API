@@ -4,8 +4,7 @@ const messageSchema = new mongoose.Schema({
     sender: {
         type: mongoose.Schema.Types.ObjectId,
         required: true,
-        refPath: 'senderModel',
-        index: true,
+        refPath: 'senderModel'
     },
     senderModel: {
         type: String,
@@ -18,13 +17,11 @@ const messageSchema = new mongoose.Schema({
     },
     timestamp: {
         type: Date,
-        default: Date.now,
-        index: true,
+        default: Date.now
     },
     read: {
         type: Boolean,
-        default: false,
-        index: true,
+        default: false
     }
 });
 
@@ -33,8 +30,7 @@ const chatSchema = new mongoose.Schema({
         user: {
             type: mongoose.Schema.Types.ObjectId,
             required: true,
-            refPath: 'model',
-            index: true,
+            refPath: 'model'
         },
         model: {
             type: String,
@@ -45,20 +41,8 @@ const chatSchema = new mongoose.Schema({
     messages: [messageSchema],
     lastMessage: {
         type: Date,
-        default: Date.now,
-        index: -1, // Descending index for sorting
-    },
-    createdAt: {
-        type: Date,
-        default: Date.now,
-        index: true,
+        default: Date.now
     }
 });
-
-// Compound index for finding conversations by participants
-chatSchema.index({ 'participants.user': 1, 'lastMessage': -1 });
-
-// TTL index for automatic cleanup of inactive chats (optional - 1 year)
-chatSchema.index({ lastMessage: 1 }, { expireAfterSeconds: 31536000, sparse: true });
 
 module.exports = mongoose.model('Chat', chatSchema);

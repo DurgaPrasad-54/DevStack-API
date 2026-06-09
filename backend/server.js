@@ -5,267 +5,165 @@ const http = require('http');
 const { Server } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
-const helmet = require('helmet');
-const compression = require('compression');
-const rateLimit = require('express-rate-limit');
-const morgan = require('morgan');
-const path = require('path');
+const Chat = require('./models/chat');
 
-// Load environment variables FIRST
+// Load environment variables
 dotenv.config();
 
-// Internal imports
-const Chat = require('./models/chat');
-const HackNotification = require('./Devstack/models/HackNotification');
-const { startHackathonStatusScheduler } = require('./Devstack/scheduler/hackathonStatusScheduler');
-const { requestLogger, morganStream, logger } = require('./utils/logger');
-const { errorHandler, notFound } = require('./utils/errorHandler');
-
-// ─── Route imports ──────────────────────────────────────────────────────────
-const UserRoutes           = require('./routes/roles');
-const csvRoutes            = require('./routes/studentcsv');
-const hackathon            = require('./Devstack/routes/Adminhackathon');
-
-// ─── App & Server setup ──────────────────────────────────────────────────────
-const app    = express();
+const pdfRoutes = require('./routes/certificates');
+const UserRoutes = require('./routes/roles');
+const csvRoutes = require('./routes/studentcsv');
+const EventRoutes = require('./routes/eventRoutes');
+const Teams = require('./routes/teams');
+const Contact = require('./routes/contactus');
+const Profile = require('./routes/profile');
+const notificationRoutes = require('./routes/notification');
+const Project = require('./routes/projects');
+const teamdata = require('./routes/teamformation');
+const teammentor = require('./routes/mentor-assign');
+const itemRoutes = require('./routes/item');
+const notesRoutes = require('./routes/notes');
+const videoRoutes = require('./routes/video');
+const examsRoute = require('./routes/examsRoute');
+const reportsRoute = require('./routes/reportsRoute');
+const chatRoutes = require('./routes/chat');
+const taskRoutes = require('./routes/taskRoutes');
+const Activetime = require('./routes/Activetime');
+const mentorApproval = require('./routes/mentorapproval');
+const maincertificate = require('./routes/main-certificates');
+const promotingStudents = require('./routes/promotingstudents');
+const mentorEvents = require('./routes/mentorevents');
+const Adminresourceapproval = require('./routes/resouresapprovalbyadmin');
+// const secondYearRequest = require('./routes/secondyearrequest');
+const app = express();
 const server = http.createServer(app);
-
-// ─── CORS configuration ──────────────────────────────────────────────────────
-const allowedOrigins = [
-  process.env.FRONTEND_URL || 'http://localhost:3000',
-  'http://localhost:3000',
-  'http://localhost:3001',
-];
-
-const checkOrigin = (origin, callback) => {
-  const isLocalhost = origin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
-  if (!origin || allowedOrigins.includes(origin) || isLocalhost) {
-    callback(null, true);
-  } else if (process.env.NODE_ENV !== 'production') {
-    callback(null, true);
-  } else {
-    callback(new Error('CORS policy violation'));
-  }
-};
-
-const corsOptions = {
-  origin: checkOrigin,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'],
-  credentials: true,
-  allowedHeaders: ['Content-Type', 'Authorization'],
-};
-
-// ─── Socket.IO setup ─────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
-    origin: checkOrigin,
-    methods: ['GET', 'POST'],
+    origin: '*', // Allow all origins for WebSocket
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Authorization', 'Content-Type'],
     credentials: true,
   },
-  // Recommended for PM2 cluster mode with sticky sessions
-  transports: ['websocket', 'polling'],
-  pingTimeout: 60000,
-  pingInterval: 25000,
 });
 
-// ─── Core Middleware (ORDER MATTERS) ─────────────────────────────────────────
-
-// 1. Security headers (helmet)
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow cross-origin images
-  contentSecurityPolicy: false, // Disable CSP here; set per-route if needed
-}));
-
-// 2. Compression (must be before routes)
-app.use(compression({ level: 6, threshold: 1024 }));
-
-// 3. CORS
-app.use(cors(corsOptions));
-
-// 4. Body parsing with limits
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
-
-// 5. HTTP request logging
-app.use(morgan('combined', { stream: morganStream }));
-
-// 6. Attach io to app for use in routes
+// Middleware
+app.use(express.json());
+app.use(
+  cors({
+    origin: '*', // Allow all origins
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD'],
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 app.set('io', io);
 
-// ─── Global Rate Limiters ─────────────────────────────────────────────────────
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 500,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: 'Too many requests, please try again later.' },
-});
+// Connect to MongoDB
+mongoose
+  .connect(process.env.MONGODB_URL, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  })
+  .then(() => {
+    console.log('MongoDB connected...');
+  })
+  .catch((err) => console.error('MongoDB connection error:', err));
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 20, // Max 20 login attempts per 15 minutes per IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: 'Too many authentication attempts, please try again later.' },
-  skipSuccessfulRequests: true, // Only count failed attempts
-});
-
-const otpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000, // 10 minutes
-  max: 5, // Max 5 OTP attempts
-  message: { success: false, message: 'Too many OTP attempts, please request a new OTP.' },
-});
-
-app.use(globalLimiter);
-
-// ─── Health Check Endpoint ───────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  const dbState = mongoose.connection.readyState;
-  const dbStatus = ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState] || 'unknown';
-
-  res.json({
-    status: dbState === 1 ? 'healthy' : 'degraded',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    database: { status: dbStatus },
-    activeConnections: io ? io.engine.clientsCount : 0,
-    memory: {
-      heapUsed: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + 'MB',
-      heapTotal: Math.round(process.memoryUsage().heapTotal / 1024 / 1024) + 'MB',
-    },
-  });
-});
-
-// ─── MongoDB Connection ──────────────────────────────────────────────────────
-const connectDB = async () => {
-  try {
-    await mongoose.connect(process.env.MONGODB_URL, {
-      maxPoolSize: 20,          // Connection pool for 1000+ users
-      minPoolSize: 5,
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-      heartbeatFrequencyMS: 10000,
-    });
-    logger.info('MongoDB connected');
-    startHackathonStatusScheduler();
-  } catch (err) {
-    logger.error('MongoDB connection failed', { error: err.message });
-    process.exit(1);
-  }
-};
-
-mongoose.connection.on('disconnected', () => {
-  logger.warn('MongoDB disconnected — attempting reconnect');
-});
-mongoose.connection.on('reconnected', () => {
-  logger.info('MongoDB reconnected');
-});
-
-connectDB();
-
-// ─── Socket.IO Authentication ────────────────────────────────────────────────
+// Store connected users
 const connectedUsers = new Map();
 
+// Socket.io authentication middleware
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
-  if (!token) return next(new Error('Authentication token missing'));
+  if (!token) {
+    return next(new Error('Authentication token missing'));
+  }
 
   try {
     const decoded = jwt.verify(token, process.env.SECRET_KEY);
-    socket.userId   = decoded.userId;
+    socket.userId = decoded.userId;
     socket.userRole = decoded.role;
     next();
   } catch (error) {
-    logger.warn('Socket auth failed', { error: error.message });
-    next(new Error('Invalid or expired token'));
+    next(new Error('Invalid token: ' + error.message));
   }
 });
 
-// ─── Socket.IO Connection Handler ────────────────────────────────────────────
+// Socket.io connection handling
 io.on('connection', (socket) => {
-  logger.info('Socket connected', { userId: socket.userId, socketId: socket.id, role: socket.userRole });
+  console.log(`User connected: ${socket.userId} (Socket ID: ${socket.id})`);
 
-  // Track connections per user (supports multiple devices)
+  // Store multiple connections per user
   if (!connectedUsers.has(socket.userId)) {
     connectedUsers.set(socket.userId, new Set());
   }
   connectedUsers.get(socket.userId).add(socket.id);
 
-  // Room-based architecture: user room + role room
-  socket.join(`user:${socket.userId}`);
-  socket.join(`role:${socket.userRole}`);
+  // Join user room for direct messages
+  socket.join(socket.userId);
 
-  socket.emit('connected', { userId: socket.userId, socketId: socket.id });
+  // Send confirmation to client
+  socket.emit('connected', {
+    userId: socket.userId,
+    socketId: socket.id,
+  });
 
-  // ── sendMessage ─────────────────────────────────────────────────────────
   socket.on('sendMessage', async (data, callback) => {
     try {
-      if (!data?.chatId || !data?.message?.content) {
+      if (!data || !data.chatId || !data.message || !data.message.content) {
         throw new Error('Invalid message data');
       }
 
-      const chat = await Chat.findById(data.chatId).lean(false);
-      if (!chat) throw new Error('Chat not found');
+      const chat = await Chat.findById(data.chatId);
+      if (!chat) {
+        throw new Error('Chat not found');
+      }
 
-      const capitalizedRole = socket.userRole.charAt(0).toUpperCase() + socket.userRole.slice(1).toLowerCase();
+      const capitalizedRole =
+        socket.userRole.charAt(0).toUpperCase() +
+        socket.userRole.slice(1).toLowerCase();
 
       const newMessage = {
-        sender:      socket.userId,
+        sender: socket.userId,
         senderModel: capitalizedRole,
-        content:     data.message.content,
-        timestamp:   new Date(),
+        content: data.message.content,
+        timestamp: new Date(),
       };
+      console.log('New message:', newMessage);
 
       chat.messages.push(newMessage);
       chat.lastMessage = new Date();
       await chat.save();
 
-      // Emit to all participants via their user rooms
+      // Emit to each participant's room instead of individual sockets
       for (const participant of chat.participants) {
-        io.to(`user:${participant.user.toString()}`).emit('newMessage', {
-          chatId:  chat._id,
+        const participantId = participant.user.toString();
+        console.log(`Emitting message to participant: ${participantId}`);
+
+        // Send to user's room (all their devices)
+        io.to(participantId).emit('newMessage', {
+          chatId: chat._id,
           message: newMessage,
         });
       }
 
+      // Send acknowledgment back to sender
       if (callback) callback({ success: true });
     } catch (error) {
-      logger.error('Socket sendMessage error', { error: error.message, userId: socket.userId });
-      if (callback) callback({ error: 'Message delivery failed' }); // Don't expose internals
+      console.error('Error handling message:', error);
+      socket.emit('error', { message: error.message });
+      if (callback) callback({ error: error.message });
     }
   });
 
-  // ── markAsRead ──────────────────────────────────────────────────────────
-  socket.on('markAsRead', async (notificationId) => {
-    try {
-      await HackNotification.findByIdAndUpdate(notificationId, {
-        $addToSet: { readBy: socket.userId },
-      });
-      io.to(`user:${socket.userId}`).emit('notificationRead', { notificationId });
-    } catch (error) {
-      logger.error('markAsRead error', { error: error.message });
-    }
-  });
+  socket.on('disconnect', () => {
+    console.log(`User disconnected: ${socket.userId}`);
 
-  // ── markHackAsRead ──────────────────────────────────────────────────────
-  socket.on('markHackAsRead', async (hackNotificationId) => {
-    try {
-      await HackNotification.findByIdAndUpdate(hackNotificationId, {
-        $addToSet: { readBy: socket.userId },
-      });
-      io.to(`user:${socket.userId}`).emit('hackNotificationRead', { hackNotificationId });
-    } catch (error) {
-      logger.error('markHackAsRead error', { error: error.message });
-    }
-  });
-
-  // ── disconnect ──────────────────────────────────────────────────────────
-  socket.on('disconnect', (reason) => {
-    logger.info('Socket disconnected', { userId: socket.userId, socketId: socket.id, reason });
-
+    // Remove this specific connection
     if (connectedUsers.has(socket.userId)) {
       connectedUsers.get(socket.userId).delete(socket.id);
+
+      // If no more connections for this user, remove from map
       if (connectedUsers.get(socket.userId).size === 0) {
         connectedUsers.delete(socket.userId);
       }
@@ -273,83 +171,38 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── API Routes ──────────────────────────────────────────────────────────────
+// Define API routes
+app.use('/pdf', pdfRoutes);
+app.use('/roles', UserRoutes);
+app.use('/csv', csvRoutes);
+app.use('/api', EventRoutes);
+app.use('/teams', Teams);
+app.use('/teamformation', teamdata);
+app.use('/mentor', teammentor);
+app.use('/contact', Contact);
+app.use('/profile', Profile);
+app.use('/notifications', notificationRoutes);
+app.use('/projects', Project);
+app.use('/items', itemRoutes);
+app.use('/notes', notesRoutes);
+app.use('/videos', videoRoutes);
+app.use('/api/exams', examsRoute);
+app.use('/api/reports', reportsRoute);
+app.use('/chat', chatRoutes);
+app.use('/api', taskRoutes);
+app.use('/activetime', Activetime);
+app.use('/mentor-approval', mentorApproval);
+app.use('/api/certificates', maincertificate);
+app.use('/api/generated-programs', maincertificate);
+app.use('/promoting-students', promotingStudents);
+app.use('/feedback', require('./routes/feedback'));
+app.use('/mentorevents', mentorEvents);
+app.use('/mentorresources', require('./routes/mentorresources'));
+app.use('/admin-approvals', Adminresourceapproval);
+// app.use('/secondyear-change', secondYearRequest);
 
-// Auth routes get rate-limited
-app.use('/roles', authLimiter, UserRoutes);
-
-// Other routes
-app.use('/csv',                csvRoutes);
-
-// Hackathon routes
-app.use('/hackathon',          hackathon);
-app.use('/hacknotifications',  require('./Devstack/routes/HackNotification'));
-app.use('/roomallocation',     require('./Devstack/routes/roomallocation'));
-app.use('/schedule',           require('./Devstack/routes/schedule'));
-app.use('/hackreg',            require('./Devstack/routes/hack-reg'));
-app.use('/hackitems',          require('./Devstack/routes/Hackitems'));
-app.use('/hacknotes',          require('./Devstack/routes/Hacknotes'));
-app.use('/hackvideos',         require('./Devstack/routes/Hackvideos'));
-app.use('/hackvideofolder',    require('./Devstack/routes/Hackvideofolder'));
-app.use('/hackfolder',         require('./Devstack/routes/Hackfolder'));
-app.use('/hackathonrequests',  require('./Devstack/routes/Hackmentor'));
-app.use('/hackteams',          require('./Devstack/routes/hackteam'));
-app.use('/problemstatements',  require('./Devstack/routes/problemstatements'));
-app.use('/studenthackteam',    require('./Devstack/routes/studenthackteam'));
-app.use('/teamprogress',       require('./Devstack/routes/teamprogress'));
-app.use('/hacksubmission',     require('./Devstack/routes/hacksubmission'));
-app.use('/hackmentorfeedback', require('./Devstack/routes/hackfeedbackmentor'));
-app.use('/hackathonattendance',require('./Devstack/routes/hackathonattendance'));
-app.use('/mentorevaluation',   require('./Devstack/routes/mentorEvaluation'));
-app.use('/api/hackathon/gallery', require('./Devstack/routes/hackGallery'));
-app.use('/winners',            require('./Devstack/routes/Winners'));
-app.use('/hackcertificates',   require('./Devstack/routes/HackCertificate'));
-app.use('/hackathon-history',  require('./Devstack/routes/hackathonHistory'));
-app.use('/mentor-hackathon-history', require('./Devstack/routes/mentorHackathonHistory'));
-
-// ─── Error Handling (must be LAST) ──────────────────────────────────────────
-app.use(notFound);
-app.use(errorHandler);
-
-// ─── Server Startup ──────────────────────────────────────────────────────────
+// Start the server
 const PORT = process.env.PORT || 5000;
-
 server.listen(PORT, () => {
-  logger.info(`Server running on port ${PORT}`, { env: process.env.NODE_ENV, port: PORT });
+  console.log(`Server running on port ${PORT}`);
 });
-
-// ─── Graceful Shutdown ───────────────────────────────────────────────────────
-const shutdown = async (signal) => {
-  logger.info(`${signal} received — beginning graceful shutdown`);
-
-  server.close(async () => {
-    logger.info('HTTP server closed');
-
-    // Close all Socket.IO connections
-    io.close(() => logger.info('Socket.IO closed'));
-
-    // Close MongoDB connection
-    try {
-      await mongoose.connection.close();
-      logger.info('MongoDB connection closed');
-    } catch (err) {
-      logger.error('Error closing MongoDB', { error: err.message });
-    }
-
-    logger.info('Graceful shutdown complete');
-    process.exit(0);
-  });
-
-  // Force kill after 10 seconds
-  setTimeout(() => {
-    logger.error('Forced shutdown after timeout');
-    process.exit(1);
-  }, 10000);
-};
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('uncaughtException',  (err) => { logger.error('Uncaught exception', { error: err.message, stack: err.stack }); process.exit(1); });
-process.on('unhandledRejection', (reason) => { logger.error('Unhandled rejection', { reason: String(reason) }); process.exit(1); });
-
-module.exports = { app, server, io };
